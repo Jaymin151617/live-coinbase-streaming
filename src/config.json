@@ -1,0 +1,13 @@
+{
+  "version": 1,
+
+  "channels": {
+    "ticker":         "coinbase.ticker",
+    "candles":        "coinbase.candles",
+    "market_trades":  "coinbase.market_trades"
+  },
+
+  "defaults": {
+    "products": ["BTC-USD", "ETH-USD", "LINK-USD", "SOL-USD", "ADA-USD"]
+  }
+}
