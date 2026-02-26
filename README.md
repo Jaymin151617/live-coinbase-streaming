@@ -1,2 +1,2 @@
-# Clash-Royale-Live-Analytics
-A real-time analytics pipeline ingesting player battle data from the Clash Royale API into Kafka, processing with PySpark, and visualizing metrics in Tableau dashboards.
+# Live Coinbase Streaming
+A real-time analytics pipeline ingesting crypto trade data from the Coinbase Advanced Trade API into Kafka, processing with PySpark, and visualizing metrics in Tableau dashboards.
