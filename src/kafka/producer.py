@@ -70,6 +70,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(threadName)s %(message)s",
 )
+# enable kafka-python logs
+logging.getLogger("kafka").setLevel(logging.INFO)
 logger = logging.getLogger("cb-kafka-bridge")
 
 # --- Load secrets ---
@@ -87,18 +89,23 @@ def build_jwt():
     return jwt_generator.build_ws_jwt(COINBASE_API_KEY, COINBASE_SECRET_PEM)
 
 # --- Kafka producer ---
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_SERVER_URL,
-    security_protocol="SSL",
-    ssl_cafile=KAFKA_CA_PATH,
-    ssl_certfile=KAFKA_SERVICE_CERT_PATH,
-    ssl_keyfile=KAFKA_SERVICE_KEY_PATH,
-    acks="all",
-    linger_ms=LINGER_MS,
-    batch_size=KAFKA_BATCH_BYTES,
-    retries=KAFKA_RETRIES,
-    value_serializer=lambda v: v if isinstance(v, (bytes, bytearray)) else v.encode("utf-8"),
-)
+try:
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_SERVER_URL,
+        security_protocol="SSL",
+        ssl_cafile=KAFKA_CA_PATH,
+        ssl_certfile=KAFKA_SERVICE_CERT_PATH,
+        ssl_keyfile=KAFKA_SERVICE_KEY_PATH,
+        acks="all",
+        linger_ms=LINGER_MS,
+        batch_size=KAFKA_BATCH_BYTES,
+        retries=KAFKA_RETRIES,
+        value_serializer=lambda v: v if isinstance(v, (bytes, bytearray)) else v.encode("utf-8"),
+    )
+except Exception:
+    logger.exception("Failed to initialize Kafka producer")
+    sys.exit(1)
+
 
 # Shared queue for messages from all websocket threads
 msg_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
