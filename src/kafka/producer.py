@@ -296,7 +296,7 @@ def shutdown(signum=None, frame=None):
         logger.exception("Producer close failed")
 
 
-if __name__ == "__main__":
+def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
@@ -331,3 +331,7 @@ if __name__ == "__main__":
         logger.exception("Exception closing producer")
 
     logger.info("Shutdown complete. Dropped messages: %d", dropped_messages)
+
+
+if __name__ == "__main__":
+    main()
