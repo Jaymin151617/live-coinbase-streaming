@@ -9,6 +9,7 @@ Production-ready Coinbase Advanced Trade -> Kafka bridge.
 - Large socket recv buffer configured via sockopt.
 """
 
+import os
 import json
 import logging
 import queue
@@ -51,7 +52,7 @@ KAFKA_SERVICE_CERT_PATH = ROOT_DIR / "secrets" / "kafka_service.cert"
 KAFKA_SERVICE_KEY_PATH = ROOT_DIR / "secrets" / "kafka_service.key"
 
 # Kafka cluster address
-KAFKA_SERVER_URL = "kafka-239aa580-jayminmistry2000-6ba1.d.aivencloud.com:23593"  # TODO: Replace with env var
+KAFKA_SERVER_URL = os.environ.get("KAFKA_SERVER_URL")
 COINBASE_WEBSOCKET_URL = "wss://advanced-trade-ws.coinbase.com"
 
 # Performance / reliability tuning
