@@ -1,18 +1,47 @@
-from kafka import KafkaConsumer
+# test_aiven_stream.py
+import os
+from pyspark.sql import SparkSession
 
-TOPIC_NAME = "coinbase.ticker"
+# config via env vars (safer) or replace defaults below
+BOOTSTRAP = os.environ.get("KAFKA_SERVER_URL")
+TOPIC = os.environ.get("TOPIC", "coinbase.ticker")
 
-consumer = KafkaConsumer(
-    TOPIC_NAME,
-    bootstrap_servers="kafka-239aa580-jayminmistry2000-6ba1.d.aivencloud.com:23593",
-    client_id = "CONSUMER_CLIENT_ID",
-    group_id = "CONSUMER_GROUP_ID",
-    security_protocol="SSL",
-    ssl_cafile="secrets/kafka_ca.pem",
-    ssl_certfile="secrets/kafka_service.cert",
-    ssl_keyfile="secrets/kafka_service.key"
+# paths & passwords for keystore/truststore
+KEYSTORE = os.environ.get("KEYSTORE")
+KEYSTORE_PASS = os.environ.get("KEYSTORE_PASS")
+KEYSTORE_TYPE = os.environ.get("KEYSTORE_TYPE")
+
+TRUSTSTORE = os.environ.get("TRUSTSTORE")
+TRUSTSTORE_PASS = os.environ.get("TRUSTSTORE_PASS")
+
+spark = SparkSession.builder.appName("aiven-kafka-test").getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+reader = (
+    spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", BOOTSTRAP)
+    .option("subscribe", TOPIC)
+    .option("startingOffsets", "earliest")
+    .option("kafka.security.protocol", "SSL")
+    .option("kafka.ssl.truststore.location", TRUSTSTORE)
+    .option("kafka.ssl.truststore.password", TRUSTSTORE_PASS)
+    .option("kafka.ssl.keystore.location", KEYSTORE)
+    .option("kafka.ssl.keystore.password", KEYSTORE_PASS)
+    .option("kafka.ssl.keystore.type", KEYSTORE_TYPE)
+    .option("kafka.ssl.key.password", KEYSTORE_PASS)
 )
 
-while True:
-    for message in consumer.poll().values():
-        print("Got message using SSL: " + message[0].value.decode('utf-8'))
+df = reader.load()
+
+# cast key/value to string and show to console
+out = df.selectExpr("topic", "CAST(value AS STRING) as value", "partition", "offset")
+
+query = (
+    out.writeStream
+    .format("console")
+    .option("truncate", False)
+    .start()
+)
+
+query.awaitTermination()
