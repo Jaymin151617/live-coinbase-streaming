@@ -35,7 +35,7 @@ reader = (
 df = reader.load()
 
 # cast key/value to string and show to console
-out = df.selectExpr("topic", "CAST(value AS STRING) as value", "partition", "offset")
+out = df.selectExpr("topic", "CAST(key AS STRING) as key", "CAST(value AS STRING) as value", "partition", "offset")
 
 query = (
     out.writeStream
