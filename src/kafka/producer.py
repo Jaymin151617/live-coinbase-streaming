@@ -24,6 +24,7 @@ from typing import Tuple
 from coinbase import jwt_generator
 
 from kafka import KafkaProducer
+from kafka.errors import UnknownTopicOrPartitionError, KafkaError
 import websocket
 
 # --- Configuration ---
@@ -102,6 +103,7 @@ try:
         batch_size=KAFKA_BATCH_BYTES,
         retries=KAFKA_RETRIES,
         value_serializer=lambda v: v if isinstance(v, (bytes, bytearray)) else v.encode("utf-8"),
+        key_serializer=lambda k: k if isinstance(k, (bytes, bytearray)) else k.encode("utf-8")
     )
 except Exception:
     logger.exception("Failed to initialize Kafka producer")
@@ -143,8 +145,15 @@ def kafka_worker(worker_id: int):
             # nothing available right now
             continue
 
-        topic, msg = item
-        producer.send(topic, msg)
+        topic, product, msg = item
+        try:
+            producer.send(topic, value=msg, key=product)
+        except UnknownTopicOrPartitionError as ue:
+            logger.error(f"Topic does not exist: {ue}")
+        except KafkaError as ke:
+            logger.error(f"Kafka error occurred: {ke}")
+        except Exception as e:
+            logger.error(str(e))
 
     # Final defensive flush
     producer.flush(timeout=5)
@@ -165,6 +174,15 @@ def send_subscription_message(ws, product):
         logger.info(f"Subscribed {channel} channel for %s", product)
 
 
+def fast_extract_channel(msg: str):
+    i = msg.find('"channel":"')
+    if i == -1:
+        return "unknown"
+    start = i + 11
+    end = msg.find('"', start)
+    return msg[start:end]
+
+
 # --- WebSocket callbacks factory (per-product) ---
 def make_callbacks(product: str):
     """Return callbacks bound to a specific product to keep per-ws minimal and fast."""
@@ -183,18 +201,11 @@ def make_callbacks(product: str):
             else:
                 text = raw_message
 
-            # try a light parse to get channel/product; fallback to bound product
-            try:
-                d = json.loads(text)
-                channel = d.get("channel")
-            except Exception:
-                # if parsing fails, still forward raw text
-                pass
-
+            channel = fast_extract_channel(text)
             topic = _sanitize_topic(str(channel))
             # Enqueue with non-blocking put and tiny timeout to avoid blocking websocket thread
             try:
-                msg_queue.put((topic, text), timeout=QUEUE_PUT_TIMEOUT)
+                msg_queue.put((topic, product, text), timeout=QUEUE_PUT_TIMEOUT)
             except queue.Full:
                 # drop message if queue full (log sampling to avoid floods)
                 with dropped_lock:
