@@ -12,6 +12,9 @@ logs/
 # Data
 data/
 
+# Spark Checkpoints
+tmp/
+
 # Secrets
 secrets/
 
