@@ -1,9 +1,9 @@
 import os
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import *
 from pyspark.sql.functions import (
     col, from_json, explode, to_timestamp, expr, sum as _sum, avg as _avg, count as _count,
-    window, when, coalesce
+    current_timestamp, date_trunc, lit, row_number, when, coalesce
 )
 
 # config via env vars
@@ -20,6 +20,9 @@ PROCESSING_TIME = "30 seconds"
 
 spark = SparkSession.builder.appName("spark-consumer").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
+
+PRODUCTS = ["BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "SOL-USD"]
+products_df = spark.createDataFrame([(p,) for p in PRODUCTS], StructType([StructField("product_id", StringType(), True)]))
 
 # --- Schemas (same as before) ---
 tradeSchema = StructType([
@@ -98,16 +101,18 @@ parsed = raw.select(
 
 first_event = col("events").getItem(0)
 
-# --- Market trades: use kafka_key as fallback product_id ---
+# === Ensure offset is carried through when exploding ===
+# For market trades:
 market_trades_exploded = (
     parsed
     .withColumn("event", first_event)
     .withColumn("trades_arr", first_event.getField("trades"))
     .where(col("trades_arr").isNotNull())
-    .select("topic", "kafka_key", explode(col("trades_arr")).alias("trade"))
+    .select("topic", "kafka_key", "offset", explode(col("trades_arr")).alias("trade"))
     .select(
         col("topic"),
         col("kafka_key"),
+        col("offset").alias("kafka_offset"),
         col("trade.price").alias("price_str"),
         col("trade.product_id").alias("trade_product_id"),
         col("trade.side").alias("side"),
@@ -119,7 +124,7 @@ market_trades_exploded = (
 
 market_trades = (
     market_trades_exploded
-    .withColumn("product_id", coalesce(col("trade_product_id"), col("kafka_key")))  # use key if product_id missing
+    .withColumn("product_id", coalesce(col("trade_product_id"), col("kafka_key")))
     .withColumn("price", col("price_str").cast("double"))
     .withColumn("size", col("size_str").cast("double"))
     .withColumn("trade_time", to_timestamp(col("trade_time_str")))
@@ -127,28 +132,17 @@ market_trades = (
     .drop("price_str", "size_str", "trade_time_str", "trade_product_id")
 )
 
-market_trades_agg = (
-    market_trades
-    .withWatermark("trade_time", "2 minutes")
-    .groupBy(window(col("trade_time"), "1 minute"), col("product_id"))
-    .agg(
-        _sum("size").alias("total_volume"),
-        (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
-        _count("*").alias("trade_count")
-    )
-    .selectExpr("window.start as window_start", "window.end as window_end", "product_id", "total_volume", "vwap", "trade_count")
-)
-
-# --- Ticker DF: again fallback to kafka_key ---
+# For tickers: carry offset
 ticker_exploded = (
     parsed
     .withColumn("event", first_event)
     .withColumn("ticker_arr", first_event.getField("tickers"))
     .where(col("ticker_arr").isNotNull())
-    .select("topic", "kafka_key", explode(col("ticker_arr")).alias("ticker"))
+    .select("topic", "kafka_key", "offset", explode(col("ticker_arr")).alias("ticker"))
     .select(
         col("topic"),
         col("kafka_key"),
+        col("offset").alias("kafka_offset"),
         col("ticker.product_id").alias("ticker_product_id"),
         col("ticker.price").alias("price_str"),
         col("ticker.best_bid").alias("best_bid_str"),
@@ -171,16 +165,17 @@ ticker_df = (
     .drop("price_str", "best_bid_str", "best_ask_str", "chg24_str", "volume_24h_str", "ticker_product_id")
 )
 
-# --- Candles DF: fallback to kafka_key ---
+# For candles: carry offset
 candles_exploded = (
     parsed
     .withColumn("event", first_event)
     .withColumn("candles_arr", first_event.getField("candles"))
     .where(col("candles_arr").isNotNull())
-    .select("topic", "kafka_key", explode(col("candles_arr")).alias("candle"))
+    .select("topic", "kafka_key", "offset", explode(col("candles_arr")).alias("candle"))
     .select(
         col("topic"),
         col("kafka_key"),
+        col("offset").alias("kafka_offset"),
         col("candle.product_id").alias("candle_product_id"),
         col("candle.open").alias("open_str"),
         col("candle.high").alias("high_str"),
@@ -206,37 +201,137 @@ candles_df = (
     .drop("open_str", "high_str", "low_str", "close_str", "start_str", "volume_str", "candle_product_id")
 )
 
+# === Helper write functions per micro-batch ===
+
+def write_market_trades(batch_df, batch_id):
+    if batch_df.rdd.isEmpty():
+        print(f"[market_trades] batch {batch_id} empty")
+
+        out = (
+            products_df
+            .withColumn("total_volume", lit(0.0))
+            .withColumn("vwap", lit(None).cast("double"))
+            .withColumn("trade_count", lit(0))
+            .withColumn("buy_count", lit(0))
+            .withColumn("sell_count", lit(0))
+            .withColumn("processed_at", date_trunc("second", current_timestamp()))
+        )
+
+        print(f"[market_trades] batch {batch_id} (no incoming rows) — full product list:")
+        out.show(truncate=False)
+        return
+
+    # aggregation
+    agg = (
+        batch_df
+        .groupBy("product_id")
+        .agg(
+            _sum("size").alias("total_volume"),
+            (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
+            _count("*").alias("trade_count"),
+            _sum(when(col("side") == "BUY", col("size"))).alias("buy_volume"),
+            _sum(when(col("side") == "SELL", col("size"))).alias("sell_volume")
+        )
+    )
+
+    # ensure 1 row per product
+    out = (
+        products_df
+        .join(agg, on="product_id", how="left")
+        .withColumn("trade_count", coalesce(col("trade_count"), lit(0)))
+        .withColumn("total_volume", coalesce(col("total_volume"), lit(0.0)))
+        .withColumn("buy_volume", coalesce(col("buy_volume"), lit(0.0)))
+        .withColumn("sell_volume", coalesce(col("sell_volume"), lit(0.0)))
+        .withColumn("vwap", when(col("total_volume") == 0, None).otherwise(col("vwap")))
+        .withColumn("processed_at", date_trunc("second", current_timestamp()))
+    )
+
+    print(f"[market_trades] batch {batch_id} results (1 row per product):")
+    out.show(truncate=False)
+
+
+def write_ticker(batch_df, batch_id):
+    if batch_df.rdd.isEmpty():
+        print(f"[ticker] batch {batch_id} empty")
+        out = products_df.withColumn("price", lit(None).cast("double")) \
+                         .withColumn("best_bid", lit(None).cast("double")) \
+                         .withColumn("best_ask", lit(None).cast("double")) \
+                         .withColumn("mid_price", lit(None).cast("double")) \
+                         .withColumn("spread", lit(None).cast("double")) \
+                         .withColumn("price_pct_chg_24h", lit(None).cast("double")) \
+                         .withColumn("volume_24h", lit(None).cast("double")) \
+                         .withColumn("processed_at", date_trunc("second", current_timestamp()))
+        print(f"[ticker] batch {batch_id} (no incoming rows) — full product list:")
+        out.show(truncate=False)
+        return
+
+    # debug: show which products were present in this batch
+    print("[ticker] distinct products in batch:")
+    batch_df.select("product_id").distinct().show(truncate=False)
+
+    # pick the latest record per product by kafka_offset within this batch
+    w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
+    latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
+
+    # left join to full product list so missing products still appear
+    out = products_df.join(latest.select("product_id", "price", "best_bid", "best_ask", "mid_price", "spread", "price_pct_chg_24h", "volume_24h"),
+                           on="product_id", how="left") \
+                     .withColumn("processed_at", date_trunc("second", current_timestamp()))
+
+    print(f"[ticker] batch {batch_id} latest per product (1 row per product):")
+    out.show(truncate=False)
+
+
+def write_candles(batch_df, batch_id):
+    if batch_df.rdd.isEmpty():
+        print(f"[candles] batch {batch_id} empty")
+        out = products_df.withColumn("open", lit(None).cast("double")) \
+                         .withColumn("high", lit(None).cast("double")) \
+                         .withColumn("low", lit(None).cast("double")) \
+                         .withColumn("close", lit(None).cast("double")) \
+                         .withColumn("start_ts", lit(None).cast("timestamp")) \
+                         .withColumn("volume", lit(None).cast("double")) \
+                         .withColumn("range", lit(None).cast("double")) \
+                         .withColumn("avg_price", lit(None).cast("double")) \
+                         .withColumn("processed_at", date_trunc("second", current_timestamp()))
+        print(f"[candles] batch {batch_id} (no incoming rows) — full product list:")
+        out.show(truncate=False)
+        return
+
+    # debug: show which products were present in this batch
+    print("[candles] distinct products in batch:")
+    batch_df.select("product_id").distinct().show(truncate=False)
+
+    w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
+    latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
+
+    out = products_df.join(latest.select("product_id", "open", "high", "low", "close", "start_ts", "volume", "range", "avg_price"),
+                           on="product_id", how="left") \
+                     .withColumn("processed_at", date_trunc("second", current_timestamp()))
+
+    print(f"[candles] batch {batch_id} latest per product (1 row per product):")
+    out.show(truncate=False)
+
+# === Attach the foreachBatch writers and triggers ===
 
 market_trades_query = (
-    market_trades_agg.writeStream
-    .format("console")
-    .option("truncate", False)
-    .option("numRows", 50)
-    .outputMode("update")
-    .option("maxOffsetsPerTrigger", 10000)
+    market_trades.writeStream
     .trigger(processingTime=PROCESSING_TIME)
+    .foreachBatch(write_market_trades)
     .start()
 )
 
 ticker_query = (
     ticker_df.writeStream
-    .format("console")
-    .option("truncate", False)
-    .option("numRows", 50)
-    .outputMode("append")
-    .option("maxOffsetsPerTrigger", 10000)
     .trigger(processingTime=PROCESSING_TIME)
+    .foreachBatch(write_ticker)
     .start()
 )
 
 candles_query = (
     candles_df.writeStream
-    .format("console")
-    .option("truncate", False)
-    .option("numRows", 50)
-    .outputMode("append")
-    .option("maxOffsetsPerTrigger", 10000)
     .trigger(processingTime=PROCESSING_TIME)
+    .foreachBatch(write_candles)
     .start()
 )
 
