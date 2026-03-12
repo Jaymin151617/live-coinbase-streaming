@@ -77,7 +77,7 @@ raw = (
     .format("kafka")
     .option("kafka.bootstrap.servers", BOOTSTRAP)
     .option("subscribe", TOPICS)
-    .option("startingOffsets", "earliest")
+    .option("startingOffsets", "latest")
     .option("kafka.security.protocol", "SSL")
     .option("kafka.ssl.truststore.location", TRUSTSTORE)
     .option("kafka.ssl.truststore.password", TRUSTSTORE_PASS)
@@ -206,8 +206,6 @@ candles_df = (
     .drop("open_str", "high_str", "low_str", "close_str", "start_str", "volume_str", "candle_product_id")
 )
 
-# --- Outputs (console for debugging) ---
-checkpoint_base = os.environ.get("CHECKPOINT_BASE", "/mnt/d/Clash-Royale-Live-Analytics/tmp/spark_checkpoints")
 
 market_trades_query = (
     market_trades_agg.writeStream
@@ -217,7 +215,6 @@ market_trades_query = (
     .outputMode("update")
     .option("maxOffsetsPerTrigger", 10000)
     .trigger(processingTime=PROCESSING_TIME)
-    .option("checkpointLocation", os.path.join(checkpoint_base, "market_trades"))
     .start()
 )
 
@@ -229,7 +226,6 @@ ticker_query = (
     .outputMode("append")
     .option("maxOffsetsPerTrigger", 10000)
     .trigger(processingTime=PROCESSING_TIME)
-    .option("checkpointLocation", os.path.join(checkpoint_base, "ticker"))
     .start()
 )
 
@@ -241,7 +237,6 @@ candles_query = (
     .outputMode("append")
     .option("maxOffsetsPerTrigger", 10000)
     .trigger(processingTime=PROCESSING_TIME)
-    .option("checkpointLocation", os.path.join(checkpoint_base, "candles"))
     .start()
 )
 
