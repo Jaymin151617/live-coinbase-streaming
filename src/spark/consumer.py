@@ -2,7 +2,7 @@ import os
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import *
 from pyspark.sql.functions import (
-    col, from_json, explode, to_timestamp, expr, sum as _sum, avg as _avg, count as _count,
+    col, from_json, explode, to_timestamp, expr, sum as _sum, count as _count,
     current_timestamp, date_trunc, lit, row_number, when, coalesce
 )
 
@@ -206,19 +206,6 @@ candles_df = (
 def write_market_trades(batch_df, batch_id):
     if batch_df.rdd.isEmpty():
         print(f"[market_trades] batch {batch_id} empty")
-
-        out = (
-            products_df
-            .withColumn("total_volume", lit(0.0))
-            .withColumn("vwap", lit(None).cast("double"))
-            .withColumn("trade_count", lit(0))
-            .withColumn("buy_count", lit(0))
-            .withColumn("sell_count", lit(0))
-            .withColumn("processed_at", date_trunc("second", current_timestamp()))
-        )
-
-        print(f"[market_trades] batch {batch_id} (no incoming rows) — full product list:")
-        out.show(truncate=False)
         return
 
     # aggregation
@@ -229,8 +216,8 @@ def write_market_trades(batch_df, batch_id):
             _sum("size").alias("total_volume"),
             (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
             _count("*").alias("trade_count"),
-            _sum(when(col("side") == "BUY", col("size"))).alias("buy_volume"),
-            _sum(when(col("side") == "SELL", col("size"))).alias("sell_volume")
+            _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"), # Original offer was a buy, seller matched it. Price goes down.
+            _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume")  # Original offer was a sell, buyer matched it. Price goes up.
         )
     )
 
@@ -246,28 +233,14 @@ def write_market_trades(batch_df, batch_id):
         .withColumn("processed_at", date_trunc("second", current_timestamp()))
     )
 
-    print(f"[market_trades] batch {batch_id} results (1 row per product):")
+    print(f"[market_trades] batch {batch_id} results:")
     out.show(truncate=False)
 
 
 def write_ticker(batch_df, batch_id):
     if batch_df.rdd.isEmpty():
         print(f"[ticker] batch {batch_id} empty")
-        out = products_df.withColumn("price", lit(None).cast("double")) \
-                         .withColumn("best_bid", lit(None).cast("double")) \
-                         .withColumn("best_ask", lit(None).cast("double")) \
-                         .withColumn("mid_price", lit(None).cast("double")) \
-                         .withColumn("spread", lit(None).cast("double")) \
-                         .withColumn("price_pct_chg_24h", lit(None).cast("double")) \
-                         .withColumn("volume_24h", lit(None).cast("double")) \
-                         .withColumn("processed_at", date_trunc("second", current_timestamp()))
-        print(f"[ticker] batch {batch_id} (no incoming rows) — full product list:")
-        out.show(truncate=False)
         return
-
-    # debug: show which products were present in this batch
-    print("[ticker] distinct products in batch:")
-    batch_df.select("product_id").distinct().show(truncate=False)
 
     # pick the latest record per product by kafka_offset within this batch
     w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
@@ -278,29 +251,14 @@ def write_ticker(batch_df, batch_id):
                            on="product_id", how="left") \
                      .withColumn("processed_at", date_trunc("second", current_timestamp()))
 
-    print(f"[ticker] batch {batch_id} latest per product (1 row per product):")
+    print(f"[ticker] batch {batch_id} latest per product:")
     out.show(truncate=False)
 
 
 def write_candles(batch_df, batch_id):
     if batch_df.rdd.isEmpty():
         print(f"[candles] batch {batch_id} empty")
-        out = products_df.withColumn("open", lit(None).cast("double")) \
-                         .withColumn("high", lit(None).cast("double")) \
-                         .withColumn("low", lit(None).cast("double")) \
-                         .withColumn("close", lit(None).cast("double")) \
-                         .withColumn("start_ts", lit(None).cast("timestamp")) \
-                         .withColumn("volume", lit(None).cast("double")) \
-                         .withColumn("range", lit(None).cast("double")) \
-                         .withColumn("avg_price", lit(None).cast("double")) \
-                         .withColumn("processed_at", date_trunc("second", current_timestamp()))
-        print(f"[candles] batch {batch_id} (no incoming rows) — full product list:")
-        out.show(truncate=False)
         return
-
-    # debug: show which products were present in this batch
-    print("[candles] distinct products in batch:")
-    batch_df.select("product_id").distinct().show(truncate=False)
 
     w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
     latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
@@ -309,7 +267,7 @@ def write_candles(batch_df, batch_id):
                            on="product_id", how="left") \
                      .withColumn("processed_at", date_trunc("second", current_timestamp()))
 
-    print(f"[candles] batch {batch_id} latest per product (1 row per product):")
+    print(f"[candles] batch {batch_id} latest per product:")
     out.show(truncate=False)
 
 # === Attach the foreachBatch writers and triggers ===
