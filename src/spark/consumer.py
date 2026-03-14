@@ -2,8 +2,8 @@ import os
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import *
 from pyspark.sql.functions import (
-    col, from_json, explode, to_timestamp, expr, sum as _sum, count as _count,
-    current_timestamp, date_trunc, lit, row_number, when, coalesce
+    col, from_json, explode, to_timestamp, expr, round as _round, sum as _sum, count as _count,
+    max as _max, current_timestamp, date_format, date_trunc, lit, row_number, when, coalesce
 )
 
 # config via env vars
@@ -17,6 +17,7 @@ TRUSTSTORE = os.environ.get("TRUSTSTORE")
 TRUSTSTORE_PASS = os.environ.get("TRUSTSTORE_PASS")
 
 PROCESSING_TIME = "30 seconds"
+TIME_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'"
 
 spark = SparkSession.builder.appName("spark-consumer").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
@@ -217,7 +218,8 @@ def write_market_trades(batch_df, batch_id):
             (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
             _count("*").alias("trade_count"),
             _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"), # Original offer was a buy, seller matched it. Price goes down.
-            _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume")  # Original offer was a sell, buyer matched it. Price goes up.
+            _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume"),  # Original offer was a sell, buyer matched it. Price goes up.
+            _max("trade_time").alias("latest_trade_ts")
         )
     )
 
@@ -226,11 +228,18 @@ def write_market_trades(batch_df, batch_id):
         products_df
         .join(agg, on="product_id", how="left")
         .withColumn("trade_count", coalesce(col("trade_count"), lit(0)))
-        .withColumn("total_volume", coalesce(col("total_volume"), lit(0.0)))
-        .withColumn("buy_volume", coalesce(col("buy_volume"), lit(0.0)))
-        .withColumn("sell_volume", coalesce(col("sell_volume"), lit(0.0)))
-        .withColumn("vwap", when(col("total_volume") == 0, None).otherwise(col("vwap")))
-        .withColumn("processed_at", date_trunc("second", current_timestamp()))
+        .withColumn("total_volume", _round(coalesce(col("total_volume"), lit(0.0)), 8))
+        .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
+        .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
+        .withColumn("vwap", _round(when(col("total_volume") == 0, None).otherwise(col("vwap")), 4))
+        .withColumn(
+            "latest_trade_ts",
+            date_format(date_trunc("second", col("latest_trade_ts")), TIME_FORMAT)
+        )
+        .withColumn(
+            "processed_at",
+            date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
+        )
     )
 
     print(f"[market_trades] batch {batch_id} results:")
@@ -247,9 +256,34 @@ def write_ticker(batch_df, batch_id):
     latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
 
     # left join to full product list so missing products still appear
-    out = products_df.join(latest.select("product_id", "price", "best_bid", "best_ask", "mid_price", "spread", "price_pct_chg_24h", "volume_24h"),
-                           on="product_id", how="left") \
-                     .withColumn("processed_at", date_trunc("second", current_timestamp()))
+    out = (
+        products_df
+        .join(
+            latest.select(
+                "product_id",
+                "price",
+                "best_bid",
+                "best_ask",
+                "mid_price",
+                "spread",
+                "price_pct_chg_24h",
+                "volume_24h"
+            ),
+            on="product_id",
+            how="left"
+        )
+        .withColumn("price", _round(coalesce(col("price"), lit(0.0)), 4))
+        .withColumn("best_bid", _round(coalesce(col("best_bid"), lit(0.0)), 4))
+        .withColumn("best_ask", _round(coalesce(col("best_ask"), lit(0.0)), 4))
+        .withColumn("mid_price", _round(coalesce(col("mid_price"), lit(0.0)), 4))
+        .withColumn("spread", _round(coalesce(col("spread"), lit(0.0)), 4))
+        .withColumn("price_pct_chg_24h", _round(coalesce(col("price_pct_chg_24h"), lit(0.0)), 4))
+        .withColumn("volume_24h", _round(coalesce(col("volume_24h"), lit(0.0)), 8))
+        .withColumn(
+            "processed_at",
+            date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
+        )
+    )
 
     print(f"[ticker] batch {batch_id} latest per product:")
     out.show(truncate=False)
@@ -263,9 +297,37 @@ def write_candles(batch_df, batch_id):
     w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
     latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
 
-    out = products_df.join(latest.select("product_id", "open", "high", "low", "close", "start_ts", "volume", "range", "avg_price"),
-                           on="product_id", how="left") \
-                     .withColumn("processed_at", date_trunc("second", current_timestamp()))
+    out = (
+        products_df
+        .join(
+            latest.select(
+                "product_id",
+                "open",
+                "high",
+                "low",
+                "close",
+                "start_ts",
+                "range",
+                "avg_price"
+            ),
+            on="product_id",
+            how="left"
+        )
+        .withColumn("open", _round(coalesce(col("open"), lit(0.0)), 4))
+        .withColumn("high", _round(coalesce(col("high"), lit(0.0)), 4))
+        .withColumn("low", _round(coalesce(col("low"), lit(0.0)), 4))
+        .withColumn("close", _round(coalesce(col("close"), lit(0.0)), 4))
+        .withColumn("range", _round(coalesce(col("range"), lit(0.0)), 4))
+        .withColumn("avg_price", _round(coalesce(col("avg_price"), lit(0.0)), 4))
+        .withColumn(
+            "start_ts",
+            date_format(date_trunc("second", col("start_ts")), TIME_FORMAT)
+        )
+        .withColumn(
+            "processed_at",
+            date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
+        )
+    )
 
     print(f"[candles] batch {batch_id} latest per product:")
     out.show(truncate=False)
