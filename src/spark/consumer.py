@@ -100,14 +100,18 @@ parsed = raw.select(
     from_json(col("value").cast("string"), topSchema).alias("j")
 ).select("topic", "partition", "offset", "kafka_key", "j.*")
 
-first_event = col("events").getItem(0)
+filtered = (
+    parsed
+    .withColumn("event", col("events").getItem(0))
+    .where(col("event").isNotNull())
+    .where(col("event.type") == "update")       # Ignore snapshots
+)
 
 # === Ensure offset is carried through when exploding ===
 # For market trades:
 market_trades_exploded = (
-    parsed
-    .withColumn("event", first_event)
-    .withColumn("trades_arr", first_event.getField("trades"))
+    filtered
+    .withColumn("trades_arr", col("event.trades"))
     .where(col("trades_arr").isNotNull())
     .select("topic", "kafka_key", "offset", explode(col("trades_arr")).alias("trade"))
     .select(
@@ -135,9 +139,8 @@ market_trades = (
 
 # For tickers: carry offset
 ticker_exploded = (
-    parsed
-    .withColumn("event", first_event)
-    .withColumn("ticker_arr", first_event.getField("tickers"))
+    filtered
+    .withColumn("ticker_arr", col("event.tickers"))
     .where(col("ticker_arr").isNotNull())
     .select("topic", "kafka_key", "offset", explode(col("ticker_arr")).alias("ticker"))
     .select(
@@ -168,9 +171,8 @@ ticker_df = (
 
 # For candles: carry offset
 candles_exploded = (
-    parsed
-    .withColumn("event", first_event)
-    .withColumn("candles_arr", first_event.getField("candles"))
+    filtered
+    .withColumn("candles_arr", col("event.candles"))
     .where(col("candles_arr").isNotNull())
     .select("topic", "kafka_key", "offset", explode(col("candles_arr")).alias("candle"))
     .select(
