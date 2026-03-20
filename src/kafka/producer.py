@@ -2,6 +2,8 @@
 """
 Production-ready Coinbase Advanced Trade -> Kafka bridge.
 
+Confluent Kafka version.
+
 - One websocket connection per product (separate threads).
 - Minimal work in websocket callbacks: parse & enqueue only.
 - Worker threads batch and send to Kafka.
@@ -21,10 +23,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Tuple
-from coinbase import jwt_generator
 
-from kafka import KafkaProducer
-from kafka.errors import UnknownTopicOrPartitionError, KafkaError
+from coinbase import jwt_generator
+from confluent_kafka import Producer, KafkaException
 import websocket
 
 # --- Configuration ---
@@ -67,6 +68,8 @@ KAFKA_RETRIES = 5
 QUEUE_PUT_TIMEOUT = 0.005           # seconds to attempt enqueue
 
 # Logging
+(ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     filename=ROOT_DIR / "logs" / "producer.log",
     level=logging.INFO,
@@ -86,32 +89,58 @@ except FileNotFoundError:
     logger.exception("Coinbase API key / secret not found; ensure secret files exist.")
     sys.exit(1)
 
+if not KAFKA_SERVER_URL:
+    logger.error("KAFKA_SERVER_URL environment variable is not set.")
+    sys.exit(1)
+
+
 # --- JWT builder ---
 def build_jwt():
     return jwt_generator.build_ws_jwt(COINBASE_API_KEY, COINBASE_SECRET_PEM)
 
-# --- Kafka producer ---
+
+# --- Confluent Kafka producer ---
+def delivery_report(err, msg):
+    if err is not None:
+        logger.error(
+            "Delivery failed topic=%s key=%s error=%s",
+            msg.topic(),
+            msg.key().decode("utf-8", errors="replace") if msg.key() else None,
+            err,
+        )
+    else:
+        logger.debug(
+            "Delivered topic=%s partition=%s offset=%s",
+            msg.topic(),
+            msg.partition(),
+            msg.offset(),
+        )
+
+
+producer_conf = {
+    "bootstrap.servers": KAFKA_SERVER_URL,
+    "security.protocol": "SSL",
+    "ssl.ca.location": str(KAFKA_CA_PATH),
+    "ssl.certificate.location": str(KAFKA_SERVICE_CERT_PATH),
+    "ssl.key.location": str(KAFKA_SERVICE_KEY_PATH),
+    "acks": "all",
+    "retries": KAFKA_RETRIES,
+    "enable.idempotence": True,
+    "retry.backoff.ms": 1000,
+    "request.timeout.ms": 30000,
+    "linger.ms": LINGER_MS,
+    "batch.size": KAFKA_BATCH_BYTES,
+}
+
 try:
-    producer = KafkaProducer(
-        bootstrap_servers=KAFKA_SERVER_URL,
-        security_protocol="SSL",
-        ssl_cafile=KAFKA_CA_PATH,
-        ssl_certfile=KAFKA_SERVICE_CERT_PATH,
-        ssl_keyfile=KAFKA_SERVICE_KEY_PATH,
-        acks="all",
-        linger_ms=LINGER_MS,
-        batch_size=KAFKA_BATCH_BYTES,
-        retries=KAFKA_RETRIES,
-        value_serializer=lambda v: v if isinstance(v, (bytes, bytearray)) else v.encode("utf-8"),
-        key_serializer=lambda k: k if isinstance(k, (bytes, bytearray)) else k.encode("utf-8")
-    )
+    producer = Producer(producer_conf)
 except Exception:
-    logger.exception("Failed to initialize Kafka producer")
+    logger.exception("Failed to initialize Confluent Kafka producer")
     sys.exit(1)
 
 
 # Shared queue for messages from all websocket threads
-msg_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
+msg_queue: "queue.Queue[Tuple[str, str, str]]" = queue.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
 
 # A simple counter for dropped messages
 dropped_messages = 0
@@ -123,42 +152,91 @@ stop_event = threading.Event()
 ws_clients: "dict[str, websocket.WebSocketApp]" = {}
 ws_clients_lock = threading.Lock()
 
+
 def _sanitize_topic(channel: str) -> str:
     c = channel.replace("-", "_").lower()
     return f"coinbase.{c}"
 
 
-# --- Worker that reads from msg_queue and sends to Kafka in batches ---
+def serialize_key(key):
+    return key.encode("utf-8") if isinstance(key, str) else key
+
+
+def serialize_value(value):
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    elif isinstance(value, dict):
+        return json.dumps(value).encode("utf-8")
+    return value
+
+
+def _produce_with_retry(topic: str, product: str, msg: str) -> bool:
+
+    for _ in range(3):
+        try:
+            producer.produce(
+                topic=topic,
+                key=serialize_key(product),
+                value=serialize_value(msg),
+                on_delivery=delivery_report,
+            )
+            producer.poll(0)  # serve delivery callbacks
+            return True
+        except BufferError:
+            producer.poll(0.1)
+        except KafkaException as ke:
+            logger.error("Kafka exception while producing topic=%s product=%s: %s", topic, product, ke)
+            return False
+        except Exception:
+            logger.exception("Unexpected error while producing topic=%s product=%s", topic, product)
+            return False
+
+    logger.warning("Dropping message after producer queue stayed full topic=%s product=%s", topic, product)
+    return False
+
+
+def _drain_batch(batch):
+    for topic, product, msg in batch:
+        _produce_with_retry(topic, product, msg)
+
+
 def kafka_worker(worker_id: int):
-    """Continuously read from msg_queue and send to Kafka in batches."""
-    logger.info(f"Kafka worker {worker_id} starting")
+    logger.info("Kafka worker %s starting", worker_id)
+
+    batch = []
+    last_flush = time.monotonic()
+    linger_seconds = LINGER_MS / 1000.0
 
     while True:
-        # Exit when stop requested and nothing left to do
-        if stop_event.is_set() and msg_queue.empty():
+        if stop_event.is_set() and msg_queue.empty() and not batch:
             break
 
         # Try to fetch one item (keeps callback responsive)
         try:
             item = msg_queue.get(timeout=0.2)
+            batch.append(item)
         except queue.Empty:
-            # nothing available right now
-            continue
+            pass
 
-        topic, product, msg = item
-        try:
-            producer.send(topic, value=msg, key=product)
-        except UnknownTopicOrPartitionError as ue:
-            logger.error(f"Topic does not exist: {ue}")
-        except KafkaError as ke:
-            logger.error(f"Kafka error occurred: {ke}")
-        except Exception as e:
-            logger.error(str(e))
+        now = time.monotonic()
+        should_flush = (
+            batch
+            and (
+                len(batch) >= BATCH_SIZE
+                or (now - last_flush) >= linger_seconds
+                or (stop_event.is_set() and msg_queue.empty())
+            )
+        )
 
-    # Final defensive flush
-    producer.flush(timeout=5)
+        if should_flush:
+            _drain_batch(batch)
+            batch.clear()
+            last_flush = now
 
-    logger.info(f"Kafka worker {worker_id} exiting")
+    if batch:
+        _drain_batch(batch)
+
+    logger.info("Kafka worker %s exiting", worker_id)
 
 
 def send_subscription_message(ws, product):
@@ -168,10 +246,10 @@ def send_subscription_message(ws, product):
             "type": "subscribe",
             "channel": channel,
             "product_ids": [product],
-            "jwt": token
+            "jwt": token,
         }
         ws.send(json.dumps(msg))
-        logger.info(f"Subscribed {channel} channel for %s", product)
+        logger.info("Subscribed %s channel for %s", channel, product)
 
 
 def fast_extract_channel(msg: str):
@@ -211,7 +289,10 @@ def make_callbacks(product: str):
                 with dropped_lock:
                     dropped_messages += 1
                     if dropped_messages % 1000 == 0:
-                        logger.warning("Dropped %d messages so far due to full queue", dropped_messages)
+                        logger.warning(
+                            "Dropped %d messages so far due to full queue",
+                            dropped_messages,
+                        )
         except Exception:
             # Keep websocket thread resilient
             logger.exception("Exception in on_message (product=%s)", product)
@@ -220,7 +301,12 @@ def make_callbacks(product: str):
         logger.error("Websocket error for %s: %s", product, err)
 
     def on_close(ws, close_status_code, close_msg):
-        logger.info("Websocket closed for %s: code=%s msg=%s", product, close_status_code, close_msg)
+        logger.info(
+            "Websocket closed for %s: code=%s msg=%s",
+            product,
+            close_status_code,
+            close_msg,
+        )
 
     return on_open, on_message, on_error, on_close
 
@@ -233,7 +319,7 @@ def run_ws_for_product(product: str):
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
-        on_close=on_close
+        on_close=on_close,
     )
 
     # register the ws so shutdown can close it
@@ -253,7 +339,10 @@ def run_ws_for_product(product: str):
                     ping_timeout=10,
                 )
             except Exception:
-                logger.exception("Websocket run_forever crashed for %s; reconnecting after backoff", product)
+                logger.exception(
+                    "Websocket run_forever crashed for %s; reconnecting after backoff",
+                    product,
+                )
                 time.sleep(5)
             # small backoff before reconnect
             time.sleep(1)
@@ -267,13 +356,23 @@ def run_ws_for_product(product: str):
 def start_workers_and_ws():
     workers = []
     for i in range(WORKER_COUNT):
-        t = threading.Thread(target=kafka_worker, args=(i,), name=f"kafka-worker-{i}", daemon=False)
+        t = threading.Thread(
+            target=kafka_worker,
+            args=(i,),
+            name=f"kafka-worker-{i}",
+            daemon=False,
+        )
         t.start()
         workers.append(t)
 
     ws_threads = []
     for product in PRODUCTS:
-        t = threading.Thread(target=run_ws_for_product, args=(product,), name=f"ws-{product}", daemon=False)
+        t = threading.Thread(
+            target=run_ws_for_product,
+            args=(product,),
+            name=f"ws-{product}",
+            daemon=False,
+        )
         t.start()
         ws_threads.append(t)
 
@@ -286,6 +385,7 @@ def shutdown(signum=None, frame=None):
     # Close websockets (closing them causes run_forever to return)
     with ws_clients_lock:
         items = list(ws_clients.items())
+
     for product, ws in items:
         try:
             logger.info("Closing websocket for %s", product)
@@ -299,11 +399,12 @@ def shutdown(signum=None, frame=None):
 
     # Try a quick flush/close for producer (don't block forever)
     try:
-        producer.flush(timeout=2)
+        producer.flush(5)
     except Exception:
-        logger.exception("Producer flush during shutdown failed or timed out")
+        logger.exception("Producer flush during shutdown failed")
+
     try:
-        producer.close(timeout=2)
+        producer.close()
     except Exception:
         logger.exception("Producer close failed")
 
@@ -334,11 +435,12 @@ def main():
 
     # final flush/close already attempted in shutdown; attempt again defensively
     try:
-        producer.flush(timeout=2)
+        producer.flush(5)
     except Exception:
         logger.exception("Exception flushing producer on shutdown")
+
     try:
-        producer.close(timeout=2)
+        producer.close()
     except Exception:
         logger.exception("Exception closing producer")
 
