@@ -20,7 +20,7 @@ PROCESSING_TIME = "30 seconds"
 TIME_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'"
 
 spark = SparkSession.builder.appName("spark-consumer").getOrCreate()
-spark.sparkContext.setLogLevel("WARN")
+spark.sparkContext.setLogLevel("ERROR")
 
 PRODUCTS = ["BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "SOL-USD"]
 products_df = spark.createDataFrame([(p,) for p in PRODUCTS], StructType([StructField("product_id", StringType(), True)]))
@@ -197,7 +197,7 @@ candles_df = (
     .withColumn("low", col("low_str").cast("double"))
     .withColumn("close", col("close_str").cast("double"))
     .withColumn("start_unix", col("start_str").cast("long"))
-    .withColumn("start_ts", when(col("start_unix").isNotNull(), to_timestamp(col("start_unix"))).otherwise(None))
+    .withColumn("start_ts_utc", when(col("start_unix").isNotNull(), to_timestamp(col("start_unix"))).otherwise(None))
     .withColumn("volume", col("volume_str").cast("double"))
     .withColumn("range", expr("high - low"))
     .withColumn("avg_price", expr("(open + high + low + close) / 4"))
@@ -221,7 +221,7 @@ def write_market_trades(batch_df, batch_id):
             _count("*").alias("trade_count"),
             _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"), # Original offer was a buy, seller matched it. Price goes down.
             _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume"),  # Original offer was a sell, buyer matched it. Price goes up.
-            _max("trade_time").alias("latest_trade_ts")
+            _max("trade_time").alias("latest_trade_ts_utc")
         )
     )
 
@@ -235,11 +235,11 @@ def write_market_trades(batch_df, batch_id):
         .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
         .withColumn("vwap", _round(when(col("total_volume") == 0, None).otherwise(col("vwap")), 4))
         .withColumn(
-            "latest_trade_ts",
-            date_format(date_trunc("second", col("latest_trade_ts")), TIME_FORMAT)
+            "latest_trade_ts_utc",
+            date_format(date_trunc("second", col("latest_trade_ts_utc")), TIME_FORMAT)
         )
         .withColumn(
-            "processed_at",
+            "processed_at_utc",
             date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
         )
     )
@@ -282,7 +282,7 @@ def write_ticker(batch_df, batch_id):
         .withColumn("price_pct_chg_24h", _round(coalesce(col("price_pct_chg_24h"), lit(0.0)), 4))
         .withColumn("volume_24h", _round(coalesce(col("volume_24h"), lit(0.0)), 8))
         .withColumn(
-            "processed_at",
+            "processed_at_utc",
             date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
         )
     )
@@ -308,7 +308,7 @@ def write_candles(batch_df, batch_id):
                 "high",
                 "low",
                 "close",
-                "start_ts",
+                "start_ts_utc",
                 "range",
                 "avg_price"
             ),
@@ -322,11 +322,11 @@ def write_candles(batch_df, batch_id):
         .withColumn("range", _round(coalesce(col("range"), lit(0.0)), 4))
         .withColumn("avg_price", _round(coalesce(col("avg_price"), lit(0.0)), 4))
         .withColumn(
-            "start_ts",
-            date_format(date_trunc("second", col("start_ts")), TIME_FORMAT)
+            "start_ts_utc",
+            date_format(date_trunc("second", col("start_ts_utc")), TIME_FORMAT)
         )
         .withColumn(
-            "processed_at",
+            "processed_at_utc",
             date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
         )
     )
