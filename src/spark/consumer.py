@@ -1,4 +1,11 @@
 import os
+import logging
+from pathlib import Path
+
+import signal
+import threading
+from py4j.protocol import Py4JError, Py4JNetworkError
+
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import *
 from pyspark.sql.functions import (
@@ -6,7 +13,24 @@ from pyspark.sql.functions import (
     max as _max, current_timestamp, date_format, date_trunc, lit, row_number, when, coalesce
 )
 
+# -------------------------------------------------------------------
+# Paths / logging
+# -------------------------------------------------------------------
+ROOT_DIR = Path(__file__).resolve().parents[2]
+
+# Logging
+(ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    filename=ROOT_DIR / "logs" / "consumer.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(threadName)s %(message)s",
+)
+logger = logging.getLogger("spark-consumer")
+
+# -------------------------------------------------------------------
 # config via env vars
+# -------------------------------------------------------------------
 BOOTSTRAP = os.environ.get("KAFKA_SERVER_URL")
 TOPICS = "coinbase.ticker,coinbase.candles,coinbase.market_trades"
 
@@ -19,11 +43,39 @@ TRUSTSTORE_PASS = os.environ.get("TRUSTSTORE_PASS")
 PROCESSING_TIME = "30 seconds"
 TIME_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'"
 
-spark = SparkSession.builder.appName("spark-consumer").getOrCreate()
-spark.sparkContext.setLogLevel("ERROR")
+required_env = {
+    "KAFKA_SERVER_URL": BOOTSTRAP,
+    "KEYSTORE": KEYSTORE,
+    "KEYSTORE_PASS": KEYSTORE_PASS,
+    "KEYSTORE_TYPE": KEYSTORE_TYPE,
+    "TRUSTSTORE": TRUSTSTORE,
+    "TRUSTSTORE_PASS": TRUSTSTORE_PASS,
+}
+
+missing_env = [name for name, value in required_env.items() if not value]
+if missing_env:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_env)}")
+
+try:
+    spark = SparkSession.builder.appName("spark-consumer").getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    logger.info("Spark session started")
+except Exception:
+    logger.exception("Failed to initialize SparkSession")
+    raise
+
+
+shutdown_requested = threading.Event()
+
+def _request_shutdown(signum, frame):
+    shutdown_requested.set()
+
 
 PRODUCTS = ["BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "SOL-USD"]
-products_df = spark.createDataFrame([(p,) for p in PRODUCTS], StructType([StructField("product_id", StringType(), True)]))
+products_df = spark.createDataFrame(
+    [(p,) for p in PRODUCTS],
+    StructType([StructField("product_id", StringType(), True)])
+)
 
 # --- Schemas (same as before) ---
 tradeSchema = StructType([
@@ -76,21 +128,26 @@ topSchema = StructType([
 ])
 
 # --- Read from Kafka and parse JSON, also capture the Kafka key (product like "BTC-USD") ---
-raw = (
-    spark.readStream
-    .format("kafka")
-    .option("kafka.bootstrap.servers", BOOTSTRAP)
-    .option("subscribe", TOPICS)
-    .option("startingOffsets", "latest")
-    .option("kafka.security.protocol", "SSL")
-    .option("kafka.ssl.truststore.location", TRUSTSTORE)
-    .option("kafka.ssl.truststore.password", TRUSTSTORE_PASS)
-    .option("kafka.ssl.keystore.location", KEYSTORE)
-    .option("kafka.ssl.keystore.password", KEYSTORE_PASS)
-    .option("kafka.ssl.keystore.type", KEYSTORE_TYPE)
-    .option("kafka.ssl.key.password", KEYSTORE_PASS)
-    .load()
-)
+try:
+    raw = (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", BOOTSTRAP)
+        .option("subscribe", TOPICS)
+        .option("startingOffsets", "latest")
+        .option("kafka.security.protocol", "SSL")
+        .option("kafka.ssl.truststore.location", TRUSTSTORE)
+        .option("kafka.ssl.truststore.password", TRUSTSTORE_PASS)
+        .option("kafka.ssl.keystore.location", KEYSTORE)
+        .option("kafka.ssl.keystore.password", KEYSTORE_PASS)
+        .option("kafka.ssl.keystore.type", KEYSTORE_TYPE)
+        .option("kafka.ssl.key.password", KEYSTORE_PASS)
+        .load()
+    )
+    logger.info("Kafka stream configured for topics: %s", TOPICS)
+except Exception:
+    logger.exception("Failed to configure Kafka read stream")
+    raise
 
 parsed = raw.select(
     col("topic"),
@@ -204,157 +261,209 @@ candles_df = (
     .drop("open_str", "high_str", "low_str", "close_str", "start_str", "volume_str", "candle_product_id")
 )
 
-# === Helper write functions per micro-batch ===
-
+# -------------------------------------------------------------------
+# Helper write functions per micro-batch
+# -------------------------------------------------------------------
 def write_market_trades(batch_df, batch_id):
-    if batch_df.rdd.isEmpty():
-        print(f"[market_trades] batch {batch_id} empty")
-        return
+    try:
+        if batch_df.rdd.isEmpty():
+            logger.warning("[market_trades] batch %s empty", batch_id)
+            return
 
-    # aggregation
-    agg = (
-        batch_df
-        .groupBy("product_id")
-        .agg(
-            _sum("size").alias("total_volume"),
-            (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
-            _count("*").alias("trade_count"),
-            _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"), # Original offer was a buy, seller matched it. Price goes down.
-            _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume"),  # Original offer was a sell, buyer matched it. Price goes up.
-            _max("trade_time").alias("latest_trade_ts_utc")
+        agg = (
+            batch_df
+            .groupBy("product_id")
+            .agg(
+                _sum("size").alias("total_volume"),
+                (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
+                _count("*").alias("trade_count"),
+                _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"),
+                _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume"),
+                _max("trade_time").alias("latest_trade_ts_utc")
+            )
         )
-    )
 
-    # ensure 1 row per product
-    out = (
-        products_df
-        .join(agg, on="product_id", how="left")
-        .withColumn("trade_count", coalesce(col("trade_count"), lit(0)))
-        .withColumn("total_volume", _round(coalesce(col("total_volume"), lit(0.0)), 8))
-        .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
-        .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
-        .withColumn("vwap", _round(when(col("total_volume") == 0, None).otherwise(col("vwap")), 4))
-        .withColumn(
-            "latest_trade_ts_utc",
-            date_format(date_trunc("second", col("latest_trade_ts_utc")), TIME_FORMAT)
+        out = (
+            products_df
+            .join(agg, on="product_id", how="left")
+            .withColumn("trade_count", coalesce(col("trade_count"), lit(0)))
+            .withColumn("total_volume", _round(coalesce(col("total_volume"), lit(0.0)), 8))
+            .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
+            .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
+            .withColumn("vwap", _round(when(col("total_volume") == 0, None).otherwise(col("vwap")), 4))
+            .withColumn(
+                "latest_trade_ts_utc",
+                date_format(date_trunc("second", col("latest_trade_ts_utc")), TIME_FORMAT)
+            )
+            .withColumn(
+                "processed_at_utc",
+                date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
+            )
         )
-        .withColumn(
-            "processed_at_utc",
-            date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
-        )
-    )
 
-    print(f"[market_trades] batch {batch_id} results:")
-    out.show(truncate=False)
+        logger.debug("[market_trades] batch %s results:", batch_id)
+        out.show(truncate=False)
+
+    except Exception:
+        logger.exception("[market_trades] failed for batch %s", batch_id)
 
 
 def write_ticker(batch_df, batch_id):
-    if batch_df.rdd.isEmpty():
-        print(f"[ticker] batch {batch_id} empty")
-        return
+    try:
+        if batch_df.rdd.isEmpty():
+            logger.warning("[ticker] batch %s empty", batch_id)
+            return
 
-    # pick the latest record per product by kafka_offset within this batch
-    w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
-    latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
+        w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
+        latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
 
-    # left join to full product list so missing products still appear
-    out = (
-        products_df
-        .join(
-            latest.select(
-                "product_id",
-                "price",
-                "best_bid",
-                "best_ask",
-                "mid_price",
-                "spread",
-                "price_pct_chg_24h",
-                "volume_24h"
-            ),
-            on="product_id",
-            how="left"
+        out = (
+            products_df
+            .join(
+                latest.select(
+                    "product_id",
+                    "price",
+                    "best_bid",
+                    "best_ask",
+                    "mid_price",
+                    "spread",
+                    "price_pct_chg_24h",
+                    "volume_24h"
+                ),
+                on="product_id",
+                how="left"
+            )
+            .withColumn("price", _round(coalesce(col("price"), lit(0.0)), 4))
+            .withColumn("best_bid", _round(coalesce(col("best_bid"), lit(0.0)), 4))
+            .withColumn("best_ask", _round(coalesce(col("best_ask"), lit(0.0)), 4))
+            .withColumn("mid_price", _round(coalesce(col("mid_price"), lit(0.0)), 4))
+            .withColumn("spread", _round(coalesce(col("spread"), lit(0.0)), 4))
+            .withColumn("price_pct_chg_24h", _round(coalesce(col("price_pct_chg_24h"), lit(0.0)), 4))
+            .withColumn("volume_24h", _round(coalesce(col("volume_24h"), lit(0.0)), 8))
+            .withColumn(
+                "processed_at_utc",
+                date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
+            )
         )
-        .withColumn("price", _round(coalesce(col("price"), lit(0.0)), 4))
-        .withColumn("best_bid", _round(coalesce(col("best_bid"), lit(0.0)), 4))
-        .withColumn("best_ask", _round(coalesce(col("best_ask"), lit(0.0)), 4))
-        .withColumn("mid_price", _round(coalesce(col("mid_price"), lit(0.0)), 4))
-        .withColumn("spread", _round(coalesce(col("spread"), lit(0.0)), 4))
-        .withColumn("price_pct_chg_24h", _round(coalesce(col("price_pct_chg_24h"), lit(0.0)), 4))
-        .withColumn("volume_24h", _round(coalesce(col("volume_24h"), lit(0.0)), 8))
-        .withColumn(
-            "processed_at_utc",
-            date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
-        )
-    )
 
-    print(f"[ticker] batch {batch_id} latest per product:")
-    out.show(truncate=False)
+        logger.debug("[ticker] batch %s latest per product:", batch_id)
+        out.show(truncate=False)
+
+    except Exception:
+        logger.exception("[ticker] failed for batch %s", batch_id)
 
 
 def write_candles(batch_df, batch_id):
-    if batch_df.rdd.isEmpty():
-        print(f"[candles] batch {batch_id} empty")
-        return
+    try:
+        if batch_df.rdd.isEmpty():
+            logger.warning("[candles] batch %s empty", batch_id)
+            return
 
-    w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
-    latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
+        w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
+        latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
 
-    out = (
-        products_df
-        .join(
-            latest.select(
-                "product_id",
-                "open",
-                "high",
-                "low",
-                "close",
+        out = (
+            products_df
+            .join(
+                latest.select(
+                    "product_id",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "start_ts_utc",
+                    "range",
+                    "avg_price"
+                ),
+                on="product_id",
+                how="left"
+            )
+            .withColumn("open", _round(coalesce(col("open"), lit(0.0)), 4))
+            .withColumn("high", _round(coalesce(col("high"), lit(0.0)), 4))
+            .withColumn("low", _round(coalesce(col("low"), lit(0.0)), 4))
+            .withColumn("close", _round(coalesce(col("close"), lit(0.0)), 4))
+            .withColumn("range", _round(coalesce(col("range"), lit(0.0)), 4))
+            .withColumn("avg_price", _round(coalesce(col("avg_price"), lit(0.0)), 4))
+            .withColumn(
                 "start_ts_utc",
-                "range",
-                "avg_price"
-            ),
-            on="product_id",
-            how="left"
+                date_format(date_trunc("second", col("start_ts_utc")), TIME_FORMAT)
+            )
+            .withColumn(
+                "processed_at_utc",
+                date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
+            )
         )
-        .withColumn("open", _round(coalesce(col("open"), lit(0.0)), 4))
-        .withColumn("high", _round(coalesce(col("high"), lit(0.0)), 4))
-        .withColumn("low", _round(coalesce(col("low"), lit(0.0)), 4))
-        .withColumn("close", _round(coalesce(col("close"), lit(0.0)), 4))
-        .withColumn("range", _round(coalesce(col("range"), lit(0.0)), 4))
-        .withColumn("avg_price", _round(coalesce(col("avg_price"), lit(0.0)), 4))
-        .withColumn(
-            "start_ts_utc",
-            date_format(date_trunc("second", col("start_ts_utc")), TIME_FORMAT)
-        )
-        .withColumn(
-            "processed_at_utc",
-            date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
-        )
+
+        logger.debug("[candles] batch %s latest per product:", batch_id)
+        out.show(truncate=False)
+
+    except Exception:
+        logger.exception("[candles] failed for batch %s", batch_id)
+
+# -------------------------------------------------------------------
+# Attach the foreachBatch writers and triggers
+# -------------------------------------------------------------------
+try:
+    market_trades_query = (
+        market_trades.writeStream
+        .trigger(processingTime=PROCESSING_TIME)
+        .foreachBatch(write_market_trades)
+        .start()
     )
+    logger.info("Started market_trades stream")
 
-    print(f"[candles] batch {batch_id} latest per product:")
-    out.show(truncate=False)
+    ticker_query = (
+        ticker_df.writeStream
+        .trigger(processingTime=PROCESSING_TIME)
+        .foreachBatch(write_ticker)
+        .start()
+    )
+    logger.info("Started ticker stream")
 
-# === Attach the foreachBatch writers and triggers ===
+    candles_query = (
+        candles_df.writeStream
+        .trigger(processingTime=PROCESSING_TIME)
+        .foreachBatch(write_candles)
+        .start()
+    )
+    logger.info("Started candles stream")
 
-market_trades_query = (
-    market_trades.writeStream
-    .trigger(processingTime=PROCESSING_TIME)
-    .foreachBatch(write_market_trades)
-    .start()
-)
+except Exception:
+    logger.exception("Failed to start one or more streaming queries")
+    raise
 
-ticker_query = (
-    ticker_df.writeStream
-    .trigger(processingTime=PROCESSING_TIME)
-    .foreachBatch(write_ticker)
-    .start()
-)
 
-candles_query = (
-    candles_df.writeStream
-    .trigger(processingTime=PROCESSING_TIME)
-    .foreachBatch(write_candles)
-    .start()
-)
+signal.signal(signal.SIGINT, _request_shutdown)
+signal.signal(signal.SIGTERM, _request_shutdown)
 
-spark.streams.awaitAnyTermination()
+queries = [market_trades_query, ticker_query, candles_query]
+
+try:
+    logger.info("Streaming started")
+    while not shutdown_requested.is_set():
+        try:
+            # wake up every second so Ctrl+C is noticed cleanly
+            spark.streams.awaitAnyTermination(1)
+        except Py4JError:
+            # ignore JVM-side noise if we're already shutting down
+            if shutdown_requested.is_set():
+                break
+            raise
+
+finally:
+    logger.info("Stopping streaming queries")
+    for q in queries:
+        try:
+            if q.isActive:
+                q.stop()
+        except (Py4JError, Py4JNetworkError, ConnectionRefusedError):
+            logger.info("Query already stopped")
+        except Exception:
+            logger.exception("Failed to stop query cleanly")
+
+    try:
+        spark.stop()
+    except (Py4JError, Py4JNetworkError, ConnectionRefusedError):
+        logger.info("Spark already stopped (expected during shutdown)")
+    except Exception:
+        logger.exception("Failed to stop Spark cleanly")
