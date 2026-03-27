@@ -24,7 +24,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 logging.basicConfig(
     filename=ROOT_DIR / "logs" / "consumer.log",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("spark-consumer")
 
@@ -489,7 +489,7 @@ finally:
 
     try:
         spark.stop()
-    except (Py4JError, Py4JNetworkError, ConnectionRefusedError):
+    except (Py4JError, Py4JJavaError, Py4JNetworkError, ConnectionRefusedError):
         logger.info("Spark already stopped (expected during shutdown)")
     except Exception:
         logger.exception("Failed to stop Spark cleanly")
