@@ -4,7 +4,7 @@ from pathlib import Path
 
 import signal
 import threading
-from py4j.protocol import Py4JError, Py4JNetworkError
+from py4j.protocol import Py4JError, Py4JJavaError, Py4JNetworkError
 
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import *
@@ -272,14 +272,14 @@ def write_market_trades(batch_df, batch_id):
 
         agg = (
             batch_df
-            .groupBy("product_id")
+            .withColumn("minute_bucket", date_trunc("minute", col("trade_time")))
+            .groupBy("product_id", "minute_bucket")
             .agg(
                 _sum("size").alias("total_volume"),
                 (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
                 _count("*").alias("trade_count"),
                 _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"),
-                _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume"),
-                _max("trade_time").alias("latest_trade_ts_utc")
+                _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume")
             )
         )
 
@@ -292,13 +292,10 @@ def write_market_trades(batch_df, batch_id):
             .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
             .withColumn("vwap", _round(when(col("total_volume") == 0, None).otherwise(col("vwap")), 4))
             .withColumn(
-                "latest_trade_ts_utc",
-                date_format(date_trunc("second", col("latest_trade_ts_utc")), TIME_FORMAT)
+                "trade_time_utc",
+                date_format(col("minute_bucket"), TIME_FORMAT)
             )
-            .withColumn(
-                "processed_at_utc",
-                date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
-            )
+            .drop("minute_bucket")
         )
 
         logger.debug("[market_trades] batch %s results:", batch_id)
@@ -456,7 +453,7 @@ finally:
         try:
             if q.isActive:
                 q.stop()
-        except (Py4JError, Py4JNetworkError, ConnectionRefusedError):
+        except (Py4JError, Py4JJavaError, Py4JNetworkError, ConnectionRefusedError):
             logger.info("Query already stopped")
         except Exception:
             logger.exception("Failed to stop query cleanly")
