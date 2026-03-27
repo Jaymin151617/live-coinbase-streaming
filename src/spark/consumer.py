@@ -41,7 +41,6 @@ TRUSTSTORE = os.environ.get("TRUSTSTORE")
 TRUSTSTORE_PASS = os.environ.get("TRUSTSTORE_PASS")
 
 PROCESSING_TIME = "30 seconds"
-TIME_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'"
 
 required_env = {
     "KAFKA_SERVER_URL": BOOTSTRAP,
@@ -305,10 +304,7 @@ def write_market_trades(batch_df, batch_id):
             .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
             .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
             .withColumn("vwap", _round(when(col("total_volume") == 0, None).otherwise(col("vwap")), 4))
-            .withColumn(
-                "trade_time_utc",
-                date_format(col("minute_bucket"), TIME_FORMAT)
-            )
+            .withColumn("trade_time_utc", col("minute_bucket"))
             .drop("minute_bucket")
         )
 
@@ -362,10 +358,7 @@ def write_ticker(batch_df, batch_id):
             .withColumn("volume_24h", _round(coalesce(col("volume_24h"), lit(0.0)), 8))
             .withColumn("high_24h", _round(coalesce(col("high_24h"), lit(0.0)), 4))
             .withColumn("low_24h", _round(coalesce(col("low_24h"), lit(0.0)), 4))
-            .withColumn(
-                "ticker_ts_utc",
-                date_format(date_trunc("second", col("minute_bucket")), TIME_FORMAT)
-            )
+            .withColumn("ticker_ts_utc", col("minute_bucket"))
             .drop("minute_bucket")
         )
 
@@ -413,10 +406,7 @@ def write_candles(batch_df, batch_id):
             .withColumn("close", _round(coalesce(col("close"), lit(0.0)), 4))
             .withColumn("range", _round(coalesce(col("range"), lit(0.0)), 4))
             .withColumn("avg_price", _round(coalesce(col("avg_price"), lit(0.0)), 4))
-            .withColumn(
-                "candle_ts_utc",
-                date_format(date_trunc("second", col("minute_bucket")), TIME_FORMAT)
-            )
+            .withColumn("candle_ts_utc", col("minute_bucket"))
             .drop("minute_bucket")
         )
 
