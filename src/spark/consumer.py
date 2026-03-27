@@ -221,7 +221,9 @@ ticker_exploded = (
         col("ticker.best_bid").alias("best_bid_str"),
         col("ticker.best_ask").alias("best_ask_str"),
         col("ticker.price_percent_chg_24_h").alias("chg24_str"),
-        col("ticker.volume_24_h").alias("volume_24h_str")
+        col("ticker.volume_24_h").alias("volume_24h_str"),
+        col("ticker.high_24_h").alias("high_24_h_str"),
+        col("ticker.low_24_h").alias("low_24_h_str"),
     )
 )
 
@@ -233,9 +235,11 @@ ticker_df = (
     .withColumn("best_ask", col("best_ask_str").cast("double"))
     .withColumn("price_pct_chg_24h", col("chg24_str").cast("double"))
     .withColumn("volume_24h", col("volume_24h_str").cast("double"))
+    .withColumn("high_24h", col("high_24_h_str").cast("double"))
+    .withColumn("low_24h", col("low_24_h_str").cast("double"))
     .withColumn("mid_price", expr("(best_bid + best_ask) / 2"))
     .withColumn("spread", expr("best_ask - best_bid"))
-    .drop("price_str", "best_bid_str", "best_ask_str", "chg24_str", "volume_24h_str", "ticker_product_id")
+    .drop("price_str", "best_bid_str", "best_ask_str", "chg24_str", "volume_24h_str", "high_24_h_str", "low_24_h_str", "ticker_product_id")
 )
 
 # For candles: carry offset
@@ -342,6 +346,8 @@ def write_ticker(batch_df, batch_id):
                     "spread",
                     "price_pct_chg_24h",
                     "volume_24h",
+                    "high_24h",
+                    "low_24h",
                     "minute_bucket"
                 ),
                 on="product_id",
@@ -354,6 +360,8 @@ def write_ticker(batch_df, batch_id):
             .withColumn("spread", _round(coalesce(col("spread"), lit(0.0)), 4))
             .withColumn("price_pct_chg_24h", _round(coalesce(col("price_pct_chg_24h"), lit(0.0)), 4))
             .withColumn("volume_24h", _round(coalesce(col("volume_24h"), lit(0.0)), 8))
+            .withColumn("high_24h", _round(coalesce(col("high_24h"), lit(0.0)), 4))
+            .withColumn("low_24h", _round(coalesce(col("low_24h"), lit(0.0)), 4))
             .withColumn(
                 "ticker_ts_utc",
                 date_format(date_trunc("second", col("minute_bucket")), TIME_FORMAT)
