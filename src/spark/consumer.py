@@ -10,7 +10,7 @@ from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import *
 from pyspark.sql.functions import (
     col, from_json, explode, to_timestamp, expr, round as _round, sum as _sum, count as _count,
-    max as _max, current_timestamp, date_format, date_trunc, lit, row_number, when, coalesce
+    date_format, date_trunc, lit, row_number, when, coalesce
 )
 
 # -------------------------------------------------------------------
@@ -70,6 +70,12 @@ shutdown_requested = threading.Event()
 def _request_shutdown(signum, frame):
     shutdown_requested.set()
 
+def parse_message_timestamp(ts_col):
+    return coalesce(
+        to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSX"),
+        to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ss.SSSSSSX"),
+        to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ssX"),
+    )
 
 PRODUCTS = ["BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "SOL-USD"]
 products_df = spark.createDataFrame(
@@ -157,6 +163,11 @@ parsed = raw.select(
     from_json(col("value").cast("string"), topSchema).alias("j")
 ).select("topic", "partition", "offset", "kafka_key", "j.*")
 
+parsed = parsed.withColumn(
+    "message_ts_utc",
+    parse_message_timestamp(col("timestamp"))
+)
+
 filtered = (
     parsed
     .withColumn("event", col("events").getItem(0))
@@ -199,11 +210,12 @@ ticker_exploded = (
     filtered
     .withColumn("ticker_arr", col("event.tickers"))
     .where(col("ticker_arr").isNotNull())
-    .select("topic", "kafka_key", "offset", explode(col("ticker_arr")).alias("ticker"))
+    .select("topic", "kafka_key", "offset", "message_ts_utc", explode(col("ticker_arr")).alias("ticker"))
     .select(
         col("topic"),
         col("kafka_key"),
         col("offset").alias("kafka_offset"),
+        col("message_ts_utc"),
         col("ticker.product_id").alias("ticker_product_id"),
         col("ticker.price").alias("price_str"),
         col("ticker.best_bid").alias("best_bid_str"),
@@ -231,17 +243,17 @@ candles_exploded = (
     filtered
     .withColumn("candles_arr", col("event.candles"))
     .where(col("candles_arr").isNotNull())
-    .select("topic", "kafka_key", "offset", explode(col("candles_arr")).alias("candle"))
+    .select("topic", "kafka_key", "offset", "message_ts_utc", explode(col("candles_arr")).alias("candle"))
     .select(
         col("topic"),
         col("kafka_key"),
         col("offset").alias("kafka_offset"),
+        col("message_ts_utc"),
         col("candle.product_id").alias("candle_product_id"),
         col("candle.open").alias("open_str"),
         col("candle.high").alias("high_str"),
         col("candle.low").alias("low_str"),
         col("candle.close").alias("close_str"),
-        col("candle.start").alias("start_str"),
         col("candle.volume").alias("volume_str"),
     )
 )
@@ -253,8 +265,6 @@ candles_df = (
     .withColumn("high", col("high_str").cast("double"))
     .withColumn("low", col("low_str").cast("double"))
     .withColumn("close", col("close_str").cast("double"))
-    .withColumn("start_unix", col("start_str").cast("long"))
-    .withColumn("start_ts_utc", when(col("start_unix").isNotNull(), to_timestamp(col("start_unix"))).otherwise(None))
     .withColumn("volume", col("volume_str").cast("double"))
     .withColumn("range", expr("high - low"))
     .withColumn("avg_price", expr("(open + high + low + close) / 4"))
@@ -311,8 +321,14 @@ def write_ticker(batch_df, batch_id):
             logger.warning("[ticker] batch %s empty", batch_id)
             return
 
-        w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
-        latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
+        w = Window.partitionBy("product_id", "minute_bucket").orderBy(col("kafka_offset").desc())
+        latest = (
+            batch_df
+            .withColumn("minute_bucket", date_trunc("minute", col("message_ts_utc")))
+            .withColumn("rn", row_number().over(w))
+            .where(col("rn") == 1)
+            .drop("rn")
+        )
 
         out = (
             products_df
@@ -325,7 +341,8 @@ def write_ticker(batch_df, batch_id):
                     "mid_price",
                     "spread",
                     "price_pct_chg_24h",
-                    "volume_24h"
+                    "volume_24h",
+                    "minute_bucket"
                 ),
                 on="product_id",
                 how="left"
@@ -338,9 +355,10 @@ def write_ticker(batch_df, batch_id):
             .withColumn("price_pct_chg_24h", _round(coalesce(col("price_pct_chg_24h"), lit(0.0)), 4))
             .withColumn("volume_24h", _round(coalesce(col("volume_24h"), lit(0.0)), 8))
             .withColumn(
-                "processed_at_utc",
-                date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
+                "ticker_ts_utc",
+                date_format(date_trunc("second", col("minute_bucket")), TIME_FORMAT)
             )
+            .drop("minute_bucket")
         )
 
         logger.debug("[ticker] batch %s latest per product:", batch_id)
@@ -356,8 +374,14 @@ def write_candles(batch_df, batch_id):
             logger.warning("[candles] batch %s empty", batch_id)
             return
 
-        w = Window.partitionBy("product_id").orderBy(col("kafka_offset").desc())
-        latest = batch_df.withColumn("rn", row_number().over(w)).where(col("rn") == 1).drop("rn")
+        w = Window.partitionBy("product_id", "minute_bucket").orderBy(col("kafka_offset").desc())
+        latest = (
+            batch_df
+            .withColumn("minute_bucket", date_trunc("minute", col("message_ts_utc")))
+            .withColumn("rn", row_number().over(w))
+            .where(col("rn") == 1)
+            .drop("rn")
+        )
 
         out = (
             products_df
@@ -368,9 +392,9 @@ def write_candles(batch_df, batch_id):
                     "high",
                     "low",
                     "close",
-                    "start_ts_utc",
                     "range",
-                    "avg_price"
+                    "avg_price",
+                    "minute_bucket"
                 ),
                 on="product_id",
                 how="left"
@@ -382,13 +406,10 @@ def write_candles(batch_df, batch_id):
             .withColumn("range", _round(coalesce(col("range"), lit(0.0)), 4))
             .withColumn("avg_price", _round(coalesce(col("avg_price"), lit(0.0)), 4))
             .withColumn(
-                "start_ts_utc",
-                date_format(date_trunc("second", col("start_ts_utc")), TIME_FORMAT)
+                "candle_ts_utc",
+                date_format(date_trunc("second", col("minute_bucket")), TIME_FORMAT)
             )
-            .withColumn(
-                "processed_at_utc",
-                date_format(date_trunc("second", current_timestamp()), TIME_FORMAT)
-            )
+            .drop("minute_bucket")
         )
 
         logger.debug("[candles] batch %s latest per product:", batch_id)
