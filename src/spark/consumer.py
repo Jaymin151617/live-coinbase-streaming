@@ -10,8 +10,10 @@ from pyspark.sql import SparkSession, Window
 from pyspark.sql.types import *
 from pyspark.sql.functions import (
     col, from_json, explode, to_timestamp, expr, round as _round, sum as _sum, count as _count,
-    date_format, date_trunc, lit, row_number, when, coalesce
+    date_trunc, lit, row_number, when, coalesce
 )
+
+from psycopg2 import pool
 
 # -------------------------------------------------------------------
 # Paths / logging
@@ -297,8 +299,7 @@ def write_market_trades(batch_df, batch_id):
         )
 
         out = (
-            products_df
-            .join(agg, on="product_id", how="left")
+            agg
             .withColumn("trade_count", coalesce(col("trade_count"), lit(0)))
             .withColumn("total_volume", _round(coalesce(col("total_volume"), lit(0.0)), 8))
             .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
@@ -331,23 +332,18 @@ def write_ticker(batch_df, batch_id):
         )
 
         out = (
-            products_df
-            .join(
-                latest.select(
-                    "product_id",
-                    "price",
-                    "best_bid",
-                    "best_ask",
-                    "mid_price",
-                    "spread",
-                    "price_pct_chg_24h",
-                    "volume_24h",
-                    "high_24h",
-                    "low_24h",
-                    "minute_bucket"
-                ),
-                on="product_id",
-                how="left"
+            latest.select(
+                "product_id",
+                "price",
+                "best_bid",
+                "best_ask",
+                "mid_price",
+                "spread",
+                "price_pct_chg_24h",
+                "volume_24h",
+                "high_24h",
+                "low_24h",
+                "minute_bucket"
             )
             .withColumn("price", _round(coalesce(col("price"), lit(0.0)), 4))
             .withColumn("best_bid", _round(coalesce(col("best_bid"), lit(0.0)), 4))
@@ -385,20 +381,15 @@ def write_candles(batch_df, batch_id):
         )
 
         out = (
-            products_df
-            .join(
-                latest.select(
-                    "product_id",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "range",
-                    "avg_price",
-                    "minute_bucket"
-                ),
-                on="product_id",
-                how="left"
+            latest.select(
+                "product_id",
+                "open",
+                "high",
+                "low",
+                "close",
+                "range",
+                "avg_price",
+                "minute_bucket"
             )
             .withColumn("open", _round(coalesce(col("open"), lit(0.0)), 4))
             .withColumn("high", _round(coalesce(col("high"), lit(0.0)), 4))
