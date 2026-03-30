@@ -291,7 +291,7 @@ def write_market_trades(batch_df, batch_id):
             .groupBy("product_id", "minute_bucket")
             .agg(
                 _sum("size").alias("total_volume"),
-                (_sum(expr("price * size")) / _sum("size")).alias("vwap"),
+                (when(_sum("size") == 0, None).otherwise(_sum(expr("price * size")) / _sum("size"))).alias("vwap"),
                 _count("*").alias("trade_count"),
                 _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"),
                 _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume")
@@ -304,7 +304,7 @@ def write_market_trades(batch_df, batch_id):
             .withColumn("total_volume", _round(coalesce(col("total_volume"), lit(0.0)), 8))
             .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
             .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
-            .withColumn("vwap", _round(when(col("total_volume") == 0, None).otherwise(col("vwap")), 4))
+            .withColumn("vwap", _round(col("vwap"), 4))
             .withColumn("trade_time_utc", col("minute_bucket"))
             .drop("minute_bucket")
         )
@@ -359,7 +359,57 @@ def write_ticker(batch_df, batch_id):
         )
 
         logger.debug("[ticker] batch %s latest per product:", batch_id)
-        out.show(truncate=False)
+        # out.show(truncate=False)
+
+        # Step 1: write to staging
+        jdbc_write(out, "coinbase.stg_ticker_snapshot")
+
+        # Step 2: merge into final table
+        upsert_query = """
+        INSERT INTO coinbase.ticker_snapshot (
+            product_id,
+            price,
+            best_bid,
+            best_ask,
+            mid_price,
+            spread,
+            price_pct_chg_24h,
+            volume_24h,
+            high_24h,
+            low_24h,
+            ticker_ts_utc
+        )
+        SELECT DISTINCT ON (product_id, ticker_ts_utc)
+            product_id,
+            price,
+            best_bid,
+            best_ask,
+            mid_price,
+            spread,
+            price_pct_chg_24h,
+            volume_24h,
+            high_24h,
+            low_24h,
+            ticker_ts_utc
+        FROM coinbase.stg_ticker_snapshot
+        WHERE ticker_ts_utc IS NOT NULL
+        ORDER BY product_id, ticker_ts_utc DESC
+        ON CONFLICT (product_id, ticker_ts_utc)
+        DO UPDATE SET
+            price = EXCLUDED.price,
+            best_bid = EXCLUDED.best_bid,
+            best_ask = EXCLUDED.best_ask,
+            mid_price = EXCLUDED.mid_price,
+            spread = EXCLUDED.spread,
+            price_pct_chg_24h = EXCLUDED.price_pct_chg_24h,
+            volume_24h = EXCLUDED.volume_24h,
+            high_24h = EXCLUDED.high_24h,
+            low_24h = EXCLUDED.low_24h;
+        """
+        run_pg_query(upsert_query)
+
+        # Step 3
+        run_pg_query("TRUNCATE coinbase.stg_ticker_snapshot;")
 
     except Exception:
         logger.exception("[ticker] failed for batch %s", batch_id)
@@ -402,7 +452,48 @@ def write_candles(batch_df, batch_id):
         )
 
         logger.debug("[candles] batch %s latest per product:", batch_id)
-        out.show(truncate=False)
+        # out.show(truncate=False)
+
+        # Step 1: write to staging
+        jdbc_write(out, "coinbase.stg_candles_snapshot")
+
+        # Step 2: merge into final table
+        upsert_query = """
+        INSERT INTO coinbase.candles_snapshot (
+            product_id,
+            open,
+            high,
+            low,
+            close,
+            range,
+            avg_price,
+            candle_ts_utc
+        )
+        SELECT DISTINCT ON (product_id, candle_ts_utc)
+            product_id,
+            open,
+            high,
+            low,
+            close,
+            range,
+            avg_price,
+            candle_ts_utc
+        FROM coinbase.stg_candles_snapshot
+        WHERE candle_ts_utc IS NOT NULL
+        ORDER BY product_id, candle_ts_utc DESC
+        ON CONFLICT (product_id, candle_ts_utc)
+        DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            range = EXCLUDED.range,
+            avg_price = EXCLUDED.avg_price
+        """
+        run_pg_query(upsert_query)
+
+        # Step 3
+        run_pg_query("TRUNCATE coinbase.stg_candles_snapshot;")
 
     except Exception:
         logger.exception("[candles] failed for batch %s", batch_id)
