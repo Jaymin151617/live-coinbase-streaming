@@ -291,7 +291,7 @@ def write_market_trades(batch_df, batch_id):
             .groupBy("product_id", "minute_bucket")
             .agg(
                 _sum("size").alias("total_volume"),
-                (when(_sum("size") == 0, None).otherwise(_sum(expr("price * size")) / _sum("size"))).alias("vwap"),
+                _sum(expr("price * size")).alias("notional_value"),
                 _count("*").alias("trade_count"),
                 _sum(when(col("side") == "BUY", col("size"))).alias("sell_volume"),
                 _sum(when(col("side") == "SELL", col("size"))).alias("buy_volume")
@@ -304,7 +304,7 @@ def write_market_trades(batch_df, batch_id):
             .withColumn("total_volume", _round(coalesce(col("total_volume"), lit(0.0)), 8))
             .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
             .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
-            .withColumn("vwap", _round(col("vwap"), 4))
+            .withColumn("notional_value", _round(col("notional_value"), 4))
             .withColumn("trade_time_utc", col("minute_bucket"))
             .drop("minute_bucket")
         )
