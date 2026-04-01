@@ -42,6 +42,12 @@ KEYSTORE_TYPE = os.environ.get("KEYSTORE_TYPE")
 TRUSTSTORE = os.environ.get("TRUSTSTORE")
 TRUSTSTORE_PASS = os.environ.get("TRUSTSTORE_PASS")
 
+PG_HOST = os.environ.get("PG_HOST")
+PG_PORT = os.environ.get("PG_PORT")
+PG_DATABASE = os.environ.get("PG_DATABASE")
+PG_USERNAME = os.environ.get("PG_USERNAME")
+PG_PASSWORD = os.environ.get("PG_PASSWORD")
+
 PROCESSING_TIME = "30 seconds"
 
 required_env = {
@@ -51,11 +57,26 @@ required_env = {
     "KEYSTORE_TYPE": KEYSTORE_TYPE,
     "TRUSTSTORE": TRUSTSTORE,
     "TRUSTSTORE_PASS": TRUSTSTORE_PASS,
+    "PG_HOST": PG_HOST,
+    "PG_PORT": PG_PORT,
+    "PG_DATABASE": PG_DATABASE,
+    "PG_USERNAME": PG_USERNAME,
+    "PG_PASSWORD": PG_PASSWORD
 }
 
 missing_env = [name for name, value in required_env.items() if not value]
 if missing_env:
     raise ValueError(f"Missing required environment variables: {', '.join(missing_env)}")
+
+pg_pool = pool.SimpleConnectionPool(
+    1, 5,  # min, max connections
+    host=PG_HOST,
+    port=PG_PORT,
+    database=PG_DATABASE,
+    user=PG_USERNAME,
+    password=PG_PASSWORD,
+    sslmode="require"
+)
 
 try:
     spark = SparkSession.builder.appName("spark-consumer").getOrCreate()
@@ -78,11 +99,37 @@ def parse_message_timestamp(ts_col):
         to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ssX"),
     )
 
-PRODUCTS = ["BTC-USD", "ETH-USD", "ADA-USD", "LINK-USD", "SOL-USD"]
-products_df = spark.createDataFrame(
-    [(p,) for p in PRODUCTS],
-    StructType([StructField("product_id", StringType(), True)])
-)
+def run_pg_query(query):
+    conn = pg_pool.getconn()
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(query)
+        cur.close()
+    finally:
+        pg_pool.putconn(conn)
+
+
+
+PG_JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DATABASE}?sslmode=require"
+
+PG_PROPS = {
+    "user": PG_USERNAME,
+    "password": PG_PASSWORD,
+}
+
+def jdbc_write(df, table_name):
+    (
+        df.coalesce(1).write
+        .format("jdbc")
+        .option("driver", "org.postgresql.Driver")
+        .option("url", PG_JDBC_URL)
+        .option("dbtable", table_name)
+        .options(**PG_PROPS)
+        .mode("append")
+        .save()
+    )
+
 
 # --- Schemas (same as before) ---
 tradeSchema = StructType([
@@ -310,7 +357,50 @@ def write_market_trades(batch_df, batch_id):
         )
 
         logger.debug("[market_trades] batch %s results:", batch_id)
-        out.show(truncate=False)
+        # out.show(truncate=False)
+
+        # Step 1: write to staging
+        jdbc_write(out, "coinbase.stg_market_trades")
+
+        # Step 2: merge into final table
+        upsert_query = """
+        INSERT INTO coinbase.market_trades_agg (
+            product_id,
+            trade_time_utc,
+            total_volume,
+            notional_value,
+            trade_count,
+            buy_volume,
+            sell_volume
+        )
+        SELECT
+            product_id,
+            trade_time_utc,
+            SUM(total_volume) AS total_volume,
+            SUM(notional_value) AS notional_value,
+            SUM(trade_count) AS trade_count,
+            SUM(buy_volume) AS buy_volume,
+            SUM(sell_volume) AS sell_volume
+        FROM coinbase.stg_market_trades
+        WHERE trade_time_utc IS NOT NULL
+        GROUP BY product_id, trade_time_utc
+        ON CONFLICT (product_id, trade_time_utc)
+        DO UPDATE SET
+            total_volume = EXCLUDED.total_volume,
+            notional_value = EXCLUDED.notional_value,
+            trade_count = EXCLUDED.trade_count,
+            buy_volume = EXCLUDED.buy_volume,
+            sell_volume = EXCLUDED.sell_volume;
+        """
+        run_pg_query(upsert_query)
+
+        # Step 3
+        run_pg_query(
+            """
+            DELETE FROM coinbase.stg_market_trades
+            WHERE trade_time_utc < NOW() - INTERVAL '2 hours';
+            """
+        )
 
     except Exception:
         logger.exception("[market_trades] failed for batch %s", batch_id)
