@@ -106,6 +106,7 @@ try:
         .config("spark.driver.memory", "1g")
         .config("spark.executor.memory", "1g")
         .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.sql.streaming.minBatchesToRetain", "10")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
