@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Tuple
+from datetime import datetime
 
 from coinbase import jwt_generator
 from confluent_kafka import Producer, KafkaException
@@ -140,7 +141,7 @@ except Exception:
 
 
 # Shared queue for messages from all websocket threads
-msg_queue: "queue.Queue[Tuple[str, str, str]]" = queue.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
+msg_queue: "queue.Queue[Tuple[str, str, str, int]]" = queue.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
 
 # A simple counter for dropped messages
 dropped_messages = 0
@@ -170,7 +171,7 @@ def serialize_value(value):
     return value
 
 
-def _produce_with_retry(topic: str, product: str, msg: str) -> bool:
+def _produce_with_retry(topic: str, product: str, msg: str, event_ts_ms: int) -> bool:
 
     for _ in range(3):
         try:
@@ -178,6 +179,7 @@ def _produce_with_retry(topic: str, product: str, msg: str) -> bool:
                 topic=topic,
                 key=serialize_key(product),
                 value=serialize_value(msg),
+                timestamp=event_ts_ms,
                 on_delivery=delivery_report,
             )
             producer.poll(0)  # serve delivery callbacks
@@ -196,8 +198,8 @@ def _produce_with_retry(topic: str, product: str, msg: str) -> bool:
 
 
 def _drain_batch(batch):
-    for topic, product, msg in batch:
-        _produce_with_retry(topic, product, msg)
+    for topic, product, msg, epoch in batch:
+        _produce_with_retry(topic, product, msg, epoch)
 
 
 def kafka_worker(worker_id: int):
@@ -260,6 +262,26 @@ def fast_extract_channel(msg: str):
     end = msg.find('"', start)
     return msg[start:end]
 
+def fast_extract_timestamp(msg: str):
+    i = msg.find('"timestamp":"')
+    if i == -1:
+        return None
+    start = i + 13
+    end = msg.find('"', start)
+    return msg[start:end]
+
+def to_epoch_ms(ts_str: str):
+    if ts_str is None:
+        return None
+    
+    # Trim nanoseconds to microseconds (first 6 digits)
+    if '.' in ts_str:
+        base, frac = ts_str.split('.')
+        frac = frac[:6]  # keep microseconds
+        ts_str = f"{base}.{frac}Z"
+
+    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    return int(dt.timestamp() * 1000)
 
 # --- WebSocket callbacks factory (per-product) ---
 def make_callbacks(product: str):
@@ -281,9 +303,13 @@ def make_callbacks(product: str):
 
             channel = fast_extract_channel(text)
             topic = _sanitize_topic(str(channel))
+
+            ts_str = fast_extract_timestamp(text)
+            event_ts_ms = to_epoch_ms(ts_str)
+
             # Enqueue with non-blocking put and tiny timeout to avoid blocking websocket thread
             try:
-                msg_queue.put((topic, product, text), timeout=QUEUE_PUT_TIMEOUT)
+                msg_queue.put((topic, product, text, event_ts_ms), timeout=QUEUE_PUT_TIMEOUT)
             except queue.Full:
                 # drop message if queue full (log sampling to avoid floods)
                 with dropped_lock:
