@@ -1,13 +1,33 @@
 {
   "version": 1,
+  "schema": "coinbase",
 
   "channels": {
-    "ticker":         "coinbase.ticker",
-    "candles":        "coinbase.candles",
-    "market_trades":  "coinbase.market_trades"
+    "ticker": "coinbase.ticker",
+    "candles": "coinbase.candles",
+    "market_trades": "coinbase.market_trades"
   },
 
-  "defaults": {
-    "products": ["BTC-USD", "ETH-USD", "LINK-USD", "SOL-USD", "ADA-USD"]
+  "products": [
+    {"name": "bitcoin", "symbol": "BTC-USD", "enabled": true},
+    {"name": "ethereum", "symbol": "ETH-USD", "enabled": true},
+    {"name": "chainlink", "symbol": "LINK-USD", "enabled": true},
+    {"name": "solana", "symbol": "SOL-USD", "enabled": true},
+    {"name": "cardano", "symbol": "ADA-USD", "enabled": true}
+  ],
+
+  "tables": {
+    "ticker": {
+      "staging": "stg_ticker_snapshot",
+      "final": "ticker_snapshot"
+    },
+    "candles": {
+      "staging": "stg_candles_snapshot",
+      "final": "candles_snapshot"
+    },
+    "market_trades": {
+      "staging": "stg_market_trades",
+      "final": "market_trades_agg"
+    }
   }
 }
