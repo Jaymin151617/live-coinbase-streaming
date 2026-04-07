@@ -250,6 +250,7 @@ try:
         .option("kafka.bootstrap.servers", BOOTSTRAP)
         .option("subscribe", TOPICS)
         .option("startingOffsets", "latest")
+        .option("failOnDataLoss", False)
         .option("kafka.security.protocol", "SSL")
         .option("kafka.ssl.truststore.location", TRUSTSTORE)
         .option("kafka.ssl.truststore.password", TRUSTSTORE_PASS)
