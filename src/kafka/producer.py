@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Tuple
-from datetime import datetime
+import calendar
 
 from coinbase import jwt_generator
 from confluent_kafka import Producer, KafkaException
@@ -271,17 +271,31 @@ def fast_extract_timestamp(msg: str):
     return msg[start:end]
 
 def to_epoch_ms(ts_str: str):
-    if ts_str is None:
-        return None
-    
-    # Trim nanoseconds to microseconds (first 6 digits)
-    if '.' in ts_str:
-        base, frac = ts_str.split('.')
-        frac = frac[:6]  # keep microseconds
-        ts_str = f"{base}.{frac}Z"
+    try:
+        year = int(ts_str[0:4])
+        month = int(ts_str[5:7])
+        day = int(ts_str[8:10])
 
-    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    return int(dt.timestamp() * 1000)
+        hour = int(ts_str[11:13])
+        minute = int(ts_str[14:16])
+        second = int(ts_str[17:19])
+
+        # Extract milliseconds
+        ms = 0
+        if '.' in ts_str:
+            frac = ts_str[20:]
+            frac = frac.replace('Z', '').split('+')[0]
+            ms = int(frac[:3].ljust(3, '0'))
+
+        epoch_sec = calendar.timegm((
+            year, month, day,
+            hour, minute, second
+        ))
+
+        return epoch_sec * 1000 + ms
+
+    except Exception:
+        return int(time.time() * 1000)
 
 # --- WebSocket callbacks factory (per-product) ---
 def make_callbacks(product: str):
