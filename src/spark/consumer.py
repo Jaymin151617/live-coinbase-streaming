@@ -110,6 +110,7 @@ try:
     TABLES = {
         key: {
             "staging": f"{SCHEMA}.{value['staging']}",
+            "raw": f"{SCHEMA}.{value.get('raw')}",
             "final": f"{SCHEMA}.{value['final']}"
         }
         for key, value in CONFIG["tables"].items()
@@ -122,6 +123,7 @@ try:
     CANDLES_FINAL_TABLE   = TABLES['candles']['final']
 
     MARKET_TRADES_STAGING_TABLE = TABLES['market_trades']['staging']
+    MARKET_TRADES_RAW_TABLE     = TABLES['market_trades']['raw']
     MARKET_TRADES_FINAL_TABLE   = TABLES['market_trades']['final']
 
 except FileNotFoundError:
@@ -372,13 +374,12 @@ def prepare_market_trades(batch_df):
             col("trade.time").alias("trade_time_str"),
             col("trade.trade_id").alias("trade_id"),
         )
-        .dropDuplicates(["trade_id"])
         .withColumn("product_id", coalesce(col("trade_product_id"), col("kafka_key")))
         .withColumn("price", col("price_str").cast("double"))
         .withColumn("size", col("size_str").cast("double"))
-        .withColumn("trade_time", to_timestamp(col("trade_time_str")))
+        .withColumn("trade_time_utc", to_timestamp(col("trade_time_str")))
         .withColumn("trade_value", expr("price * size"))
-        .drop("price_str", "size_str", "trade_time_str", "trade_product_id")
+        .drop("price_str", "size_str", "trade_time_str", "trade_product_id", "price")
     )
 
 
@@ -460,37 +461,28 @@ def prepare_candles(batch_df):
 
 
 def write_market_trades(batch_df, batch_id):
-    # Step 1: aggregate only this batch
-    agg = (
-        batch_df.withColumn("minute_bucket", date_trunc("minute", col("trade_time")))
-        .groupBy("product_id", "minute_bucket")
-        .agg(
-            _sum("size").alias("total_volume"),
-            _sum(expr("price * size")).alias("notional_value"),
-            _count("*").alias("trade_count"),
-            _sum(when(col("side") == "BUY", col("size"))).alias("buy_volume"),
-            _sum(when(col("side") == "SELL", col("size"))).alias("sell_volume"),
+    # batch_df is already one row per trade from prepare_market_trades()
+    raw_out = (
+        batch_df.select(
+            "trade_id",
+            "product_id",
+            "side",
+            "trade_value",
+            "size",
+            "trade_time_utc",
         )
+        .dropDuplicates(["trade_id"])  # keeps same-batch duplicates out
     )
 
-    out = (
-        agg.withColumn("trade_count", coalesce(col("trade_count"), lit(0)))
-        .withColumn("total_volume", _round(coalesce(col("total_volume"), lit(0.0)), 8))
-        .withColumn("buy_volume", _round(coalesce(col("buy_volume"), lit(0.0)), 8))
-        .withColumn("sell_volume", _round(coalesce(col("sell_volume"), lit(0.0)), 8))
-        .withColumn("notional_value", _round(coalesce(col("notional_value"), lit(0.0)), 4))
-        .withColumn("trade_time_utc", col("minute_bucket"))
-        .drop("minute_bucket")
-    )
+    # write raw rows into staging
+    jdbc_write(raw_out, MARKET_TRADES_STAGING_TABLE)
 
-    # Step 2: write batch aggregates to staging (optional but fine)
-    jdbc_write(out, MARKET_TRADES_STAGING_TABLE)
-
-    # Step 3: incremental UPSERT (ADD, not replace)
+    # dedupe into permanent raw table, then update summary from only newly inserted rows
     run_pg_query(
         file_path=SQL_PATH / "upsert_market_trades.sql",
         staging_table=MARKET_TRADES_STAGING_TABLE,
-        final_table=MARKET_TRADES_FINAL_TABLE
+        raw_table=MARKET_TRADES_RAW_TABLE,
+        final_table=MARKET_TRADES_FINAL_TABLE,
     )
 
     logger.debug("[market_trades] batch %s results:", batch_id)

@@ -27,6 +27,7 @@
     },
     "market_trades": {
       "staging": "stg_market_trades",
+      "raw": "raw_market_trades",
       "final": "market_trades_agg"
     }
   }
