@@ -1,8 +1,11 @@
 import logging
 import os
+import sys
+import json
 import signal
 import threading
 from pathlib import Path
+from functools import lru_cache
 
 from py4j.protocol import Py4JError, Py4JJavaError, Py4JNetworkError
 from psycopg2 import pool
@@ -36,6 +39,8 @@ from pyspark.sql.types import (
 # Paths / logging
 # -------------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parents[2]
+CONFIG_PATH = ROOT_DIR / "src" / "config.json"
+SQL_PATH = ROOT_DIR / "src" / "sql"
 
 # Logging
 (ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
@@ -52,6 +57,11 @@ logger = logging.getLogger("spark-consumer")
 # config via env vars
 # -------------------------------------------------------------------
 BOOTSTRAP = os.environ.get("KAFKA_SERVER_URL")
+SPARK_THREADS = os.environ.get("SPARK_THREADS", "2")
+SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
+SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
+SPARK_CHECKPOINTS_TO_RETAIN = os.environ.get("SPARK_CHECKPOINTS_TO_RETAIN", "10")
+
 TOPICS = "coinbase.ticker,coinbase.candles,coinbase.market_trades"
 
 KEYSTORE = os.environ.get("KEYSTORE")
@@ -66,7 +76,7 @@ PG_DATABASE = os.environ.get("PG_DATABASE")
 PG_USERNAME = os.environ.get("PG_USERNAME")
 PG_PASSWORD = os.environ.get("PG_PASSWORD")
 
-PROCESSING_TIME = "30 seconds"
+PROCESSING_TIME = os.environ.get("PROCESSING_TIME", "30 seconds")
 CHECKPOINT_DIR = str(ROOT_DIR / "checkpoints" / "coinbase_consumer")
 JDBC_WRITE_PARTITIONS = int(os.environ.get("JDBC_WRITE_PARTITIONS", "4"))
 JDBC_BATCHSIZE = int(os.environ.get("JDBC_BATCHSIZE", "1000"))
@@ -88,6 +98,45 @@ missing_env = [name for name, value in required_env.items() if not value]
 if missing_env:
     raise ValueError(f"Missing required environment variables: {', '.join(missing_env)}")
 
+# --- Configuration ---
+try:
+    with open(CONFIG_PATH, "r") as cfg:
+        CONFIG = json.load(cfg)
+
+    TOPICS = ",".join(CONFIG["channels"].values())
+
+    SCHEMA = CONFIG["schema"]
+
+    TABLES = {
+        key: {
+            "staging": f"{SCHEMA}.{value['staging']}",
+            "final": f"{SCHEMA}.{value['final']}"
+        }
+        for key, value in CONFIG["tables"].items()
+    }
+
+    TICKER_STAGING_TABLE = TABLES['ticker']['staging']
+    TICKER_FINAL_TABLE   = TABLES['ticker']['final']
+
+    CANDLES_STAGING_TABLE = TABLES['candles']['staging']
+    CANDLES_FINAL_TABLE   = TABLES['candles']['final']
+
+    MARKET_TRADES_STAGING_TABLE = TABLES['market_trades']['staging']
+    MARKET_TRADES_FINAL_TABLE   = TABLES['market_trades']['final']
+
+except FileNotFoundError:
+    logger.exception("Config file not found.")
+    sys.exit(1)
+
+except json.JSONDecodeError:
+    logger.exception("Invalid JSON in config file.")
+    sys.exit(1)
+
+except KeyError:
+    logger.exception("Config file in wrong format.")
+    sys.exit(1)
+
+
 pg_pool = pool.SimpleConnectionPool(
     1,
     5,
@@ -102,11 +151,11 @@ pg_pool = pool.SimpleConnectionPool(
 try:
     spark = (
         SparkSession.builder.appName("spark-consumer")
-        .master("local[2]")
-        .config("spark.driver.memory", "1g")
-        .config("spark.executor.memory", "1g")
+        .master(f"local[{SPARK_THREADS}]")
+        .config("spark.driver.memory", SPARK_DRIVER_MEMORY)
+        .config("spark.executor.memory", SPARK_EXECUTOR_MEMORY)
         .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.streaming.minBatchesToRetain", "10")
+        .config("spark.sql.streaming.minBatchesToRetain", SPARK_CHECKPOINTS_TO_RETAIN)
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -130,17 +179,6 @@ def parse_message_timestamp(ts_col):
         to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ssX"),
     )
 
-
-def run_pg_query(query):
-    conn = pg_pool.getconn()
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(query)
-    finally:
-        pg_pool.putconn(conn)
-
-
 PG_JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DATABASE}?sslmode=require"
 PG_PROPS = {
     "user": PG_USERNAME,
@@ -148,7 +186,6 @@ PG_PROPS = {
     "driver": "org.postgresql.Driver",
     "batchsize": str(JDBC_BATCHSIZE),
 }
-
 
 def jdbc_write(df, table_name):
     write_partitions = min(max(df.rdd.getNumPartitions(), 1), JDBC_WRITE_PARTITIONS)
@@ -162,17 +199,50 @@ def jdbc_write(df, table_name):
         .save()
     )
 
+# Cache SQL files to avoid repeated disk reads
+@lru_cache(maxsize=10)
+def load_sql(file_path: str) -> str:
+    path = Path(file_path)
+
+    if not path.exists():
+        logger.exception(f"SQL file not found: {file_path}")
+        sys.exit(1)
+
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except Exception:
+        logger.exception(f"Failed to read SQL file: {file_path}")
+        sys.exit(1)
+
+def run_pg_query(file_path: str = None, **kwargs):
+
+    query_template = load_sql(file_path)
+    try:
+        query = query_template.format(**kwargs)
+    except KeyError as e:
+        raise ValueError(f"Missing SQL placeholder: {e}")
+
+    conn = pg_pool.getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(query)
+    finally:
+        pg_pool.putconn(conn)
 
 def truncate_staging_tables():
     try:
         logger.info("Truncating staging tables at startup")
 
-        run_pg_query("""
-            TRUNCATE TABLE
-                coinbase.stg_market_trades,
-                coinbase.stg_ticker_snapshot,
-                coinbase.stg_candles_snapshot;
-        """)
+        run_pg_query(
+            file_path=SQL_PATH / "truncate_tables.sql",
+            tables=", ".join([
+                MARKET_TRADES_STAGING_TABLE,
+                TICKER_STAGING_TABLE,
+                CANDLES_STAGING_TABLE
+            ])
+        )
 
         logger.info("Staging tables truncated successfully")
 
@@ -390,16 +460,6 @@ def prepare_candles(batch_df):
 
 
 def write_market_trades(batch_df, batch_id):
-
-    # Step 0: filter late data (max 2 minutes allowed)
-    batch_df = batch_df.where(
-        col("trade_time") >= current_timestamp() - expr("INTERVAL 2 minutes")
-    )
-
-    if batch_df.rdd.isEmpty():
-        logger.info(f"[market_trades] batch {batch_id} empty after filter")
-        return
-
     # Step 1: aggregate only this batch
     agg = (
         batch_df.withColumn("minute_bucket", date_trunc("minute", col("trade_time")))
@@ -424,40 +484,13 @@ def write_market_trades(batch_df, batch_id):
     )
 
     # Step 2: write batch aggregates to staging (optional but fine)
-    jdbc_write(out, "coinbase.stg_market_trades")
+    jdbc_write(out, MARKET_TRADES_STAGING_TABLE)
 
     # Step 3: incremental UPSERT (ADD, not replace)
     run_pg_query(
-        """
-        INSERT INTO coinbase.market_trades_agg (
-            product_id,
-            trade_time_utc,
-            total_volume,
-            notional_value,
-            trade_count,
-            buy_volume,
-            sell_volume
-        )
-        SELECT
-            product_id,
-            trade_time_utc,
-            total_volume,
-            notional_value,
-            trade_count,
-            buy_volume,
-            sell_volume
-        FROM coinbase.stg_market_trades
-        WHERE trade_time_utc IS NOT NULL
-        ON CONFLICT (product_id, trade_time_utc)
-        DO UPDATE SET
-            total_volume = coinbase.market_trades_agg.total_volume + EXCLUDED.total_volume,
-            notional_value = coinbase.market_trades_agg.notional_value + EXCLUDED.notional_value,
-            trade_count = coinbase.market_trades_agg.trade_count + EXCLUDED.trade_count,
-            buy_volume = coinbase.market_trades_agg.buy_volume + EXCLUDED.buy_volume,
-            sell_volume = coinbase.market_trades_agg.sell_volume + EXCLUDED.sell_volume;
-
-        TRUNCATE coinbase.stg_market_trades;
-        """
+        file_path=SQL_PATH / "upsert_market_trades.sql",
+        staging_table=MARKET_TRADES_STAGING_TABLE,
+        final_table=MARKET_TRADES_FINAL_TABLE
     )
 
     logger.debug("[market_trades] batch %s results:", batch_id)
@@ -499,52 +532,12 @@ def write_ticker(batch_df, batch_id):
         .drop("minute_bucket")
     )
 
-    jdbc_write(out, "coinbase.stg_ticker_snapshot")
+    jdbc_write(out, TICKER_STAGING_TABLE)
 
     run_pg_query(
-        """
-        INSERT INTO coinbase.ticker_snapshot (
-            product_id,
-            price,
-            best_bid,
-            best_ask,
-            mid_price,
-            spread,
-            price_pct_chg_24h,
-            volume_24h,
-            high_24h,
-            low_24h,
-            ticker_ts_utc
-        )
-        SELECT DISTINCT ON (product_id, ticker_ts_utc)
-            product_id,
-            price,
-            best_bid,
-            best_ask,
-            mid_price,
-            spread,
-            price_pct_chg_24h,
-            volume_24h,
-            high_24h,
-            low_24h,
-            ticker_ts_utc
-        FROM coinbase.stg_ticker_snapshot
-        WHERE ticker_ts_utc IS NOT NULL
-        ORDER BY product_id, ticker_ts_utc DESC
-        ON CONFLICT (product_id, ticker_ts_utc)
-        DO UPDATE SET
-            price = EXCLUDED.price,
-            best_bid = EXCLUDED.best_bid,
-            best_ask = EXCLUDED.best_ask,
-            mid_price = EXCLUDED.mid_price,
-            spread = EXCLUDED.spread,
-            price_pct_chg_24h = EXCLUDED.price_pct_chg_24h,
-            volume_24h = EXCLUDED.volume_24h,
-            high_24h = EXCLUDED.high_24h,
-            low_24h = EXCLUDED.low_24h;
-
-        TRUNCATE coinbase.stg_ticker_snapshot;
-        """
+        file_path=SQL_PATH / "upsert_tickers.sql",
+        staging_table=TICKER_STAGING_TABLE,
+        final_table=TICKER_FINAL_TABLE
     )
 
     logger.debug("[ticker] batch %s results:", batch_id)
@@ -571,43 +564,12 @@ def write_candles(batch_df, batch_id):
         .drop("minute_bucket")
     )
 
-    jdbc_write(out, "coinbase.stg_candles_snapshot")
+    jdbc_write(out, CANDLES_STAGING_TABLE)
 
     run_pg_query(
-        """
-        INSERT INTO coinbase.candles_snapshot (
-            product_id,
-            open,
-            high,
-            low,
-            close,
-            range,
-            avg_price,
-            candle_ts_utc
-        )
-        SELECT DISTINCT ON (product_id, candle_ts_utc)
-            product_id,
-            open,
-            high,
-            low,
-            close,
-            range,
-            avg_price,
-            candle_ts_utc
-        FROM coinbase.stg_candles_snapshot
-        WHERE candle_ts_utc IS NOT NULL
-        ORDER BY product_id, candle_ts_utc DESC
-        ON CONFLICT (product_id, candle_ts_utc)
-        DO UPDATE SET
-            open = EXCLUDED.open,
-            high = EXCLUDED.high,
-            low = EXCLUDED.low,
-            close = EXCLUDED.close,
-            range = EXCLUDED.range,
-            avg_price = EXCLUDED.avg_price;
-
-        TRUNCATE coinbase.stg_candles_snapshot;
-        """
+        file_path=SQL_PATH / "upsert_candles.sql",
+        staging_table=CANDLES_STAGING_TABLE,
+        final_table=CANDLES_FINAL_TABLE
     )
 
     logger.debug("[candles] batch %s results:", batch_id)

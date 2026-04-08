@@ -29,22 +29,6 @@ from coinbase import jwt_generator
 from confluent_kafka import Producer, KafkaException
 import websocket
 
-# --- Configuration ---
-PRODUCTS = [
-    "BTC-USD",     # Bitcoin
-    "ETH-USD",     # Ethereum
-    "LINK-USD",    # Chainlink
-    "SOL-USD",     # Solana
-    "ADA-USD"      # Cardano
-]
-
-CHANNELS = [
-    "ticker",
-    "candles",
-    "market_trades",
-    # "heartbeats"     # Required in production to verify sequence of messages
-]
-
 # Paths
 ROOT_DIR = Path(__file__).resolve().parents[2]
 
@@ -53,10 +37,11 @@ COINBASE_SECRET_KEY_PATH = ROOT_DIR / "secrets" / "cb_secret_key.pem"
 KAFKA_CA_PATH = ROOT_DIR / "secrets" / "kafka_ca.pem"
 KAFKA_SERVICE_CERT_PATH = ROOT_DIR / "secrets" / "kafka_service.cert"
 KAFKA_SERVICE_KEY_PATH = ROOT_DIR / "secrets" / "kafka_service.key"
+CONFIG_PATH = ROOT_DIR / "src" / "config.json"
 
 # Kafka cluster address
 KAFKA_SERVER_URL = os.environ.get("KAFKA_SERVER_URL")
-COINBASE_WEBSOCKET_URL = "wss://advanced-trade-ws.coinbase.com"
+COINBASE_WEBSOCKET_URL = os.environ.get("COINBASE_WEBSOCKET_URL")
 
 # Performance / reliability tuning
 SO_RCVBUF_BYTES = 4 * 1024 * 1024   # 4MB receive buffer
@@ -67,6 +52,8 @@ LINGER_MS = 50                      # ms to wait for a batch before send
 KAFKA_BATCH_BYTES = 256 * 1024      # broker-side batch size hint (bytes)
 KAFKA_RETRIES = 5
 QUEUE_PUT_TIMEOUT = 0.005           # seconds to attempt enqueue
+RETRY_BACKOFF = 1000
+REQUEST_TIMEOUT = 30000
 
 # Logging
 (ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
@@ -92,6 +79,31 @@ except FileNotFoundError:
 
 if not KAFKA_SERVER_URL:
     logger.error("KAFKA_SERVER_URL environment variable is not set.")
+    sys.exit(1)
+
+# --- Configuration ---
+try:
+    with open(CONFIG_PATH, "r") as cfg:
+        CONFIG = json.load(cfg)
+
+    PRODUCTS = [
+        product["symbol"]
+        for product in CONFIG["products"]
+        if product.get("enabled", False)
+    ]
+
+    CHANNELS = list(CONFIG["channels"].keys())
+
+except FileNotFoundError:
+    logger.exception("Config file not found.")
+    sys.exit(1)
+
+except json.JSONDecodeError:
+    logger.exception("Invalid JSON in config file.")
+    sys.exit(1)
+
+except KeyError:
+    logger.exception("Config file in wrong format.")
     sys.exit(1)
 
 
@@ -127,8 +139,8 @@ producer_conf = {
     "acks": "all",
     "retries": KAFKA_RETRIES,
     "enable.idempotence": True,
-    "retry.backoff.ms": 1000,
-    "request.timeout.ms": 30000,
+    "retry.backoff.ms": RETRY_BACKOFF,
+    "request.timeout.ms": REQUEST_TIMEOUT,
     "linger.ms": LINGER_MS,
     "batch.size": KAFKA_BATCH_BYTES,
 }
