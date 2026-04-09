@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import json
+import time
 import signal
 import threading
 from pathlib import Path
@@ -22,6 +23,7 @@ from pyspark.sql.functions import (
     lit,
     row_number,
     round as _round,
+    size,
     sum as _sum,
     to_timestamp,
     when,
@@ -77,9 +79,10 @@ PG_USERNAME = os.environ.get("PG_USERNAME")
 PG_PASSWORD = os.environ.get("PG_PASSWORD")
 
 PROCESSING_TIME = os.environ.get("PROCESSING_TIME", "30 seconds")
+SPARK_BATCHSIZE = os.environ.get("SPARK_BATCHSIZE", "2000")
 CHECKPOINT_DIR = str(ROOT_DIR / "checkpoints" / "coinbase_consumer")
 JDBC_WRITE_PARTITIONS = int(os.environ.get("JDBC_WRITE_PARTITIONS", "4"))
-JDBC_BATCHSIZE = int(os.environ.get("JDBC_BATCHSIZE", "1000"))
+JDBC_BATCHSIZE = int(os.environ.get("JDBC_BATCHSIZE", "2000"))
 
 required_env = {
     "KAFKA_SERVER_URL": BOOTSTRAP,
@@ -158,6 +161,7 @@ try:
         .config("spark.executor.memory", SPARK_EXECUTOR_MEMORY)
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.streaming.minBatchesToRetain", SPARK_CHECKPOINTS_TO_RETAIN)
+        .config("spark.sql.streaming.metricsEnabled", "false")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -168,17 +172,32 @@ except Exception:
 
 
 shutdown_requested = threading.Event()
+batch_in_progress = threading.Event()
+query = None
 
 
 def _request_shutdown(signum, frame):
+    logger.info("Received signal %s; will stop after current micro-batch", signum)
     shutdown_requested.set()
+
+def _shutdown_watcher():
+    # Wait until a shutdown is requested.
+    shutdown_requested.wait()
+
+    # Let the active batch finish before stopping the query.
+    while batch_in_progress.is_set():
+        time.sleep(0.25)
+
+    global query
+    if query is not None and query.isActive:
+        logger.info("Stopping query cleanly at batch boundary")
+        query.stop()
 
 
 def parse_message_timestamp(ts_col):
     return coalesce(
         to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSX"),
-        to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ss.SSSSSSX"),
-        to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ssX"),
+        to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ss.SSSSSSX")
     )
 
 PG_JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DATABASE}?sslmode=require"
@@ -190,12 +209,16 @@ PG_PROPS = {
 }
 
 def jdbc_write(df, table_name):
-    write_partitions = min(max(df.rdd.getNumPartitions(), 1), JDBC_WRITE_PARTITIONS)
-    staged = df.coalesce(write_partitions)
+
+    # Always control partitions explicitly
+    staged = df.repartition(JDBC_WRITE_PARTITIONS)
+
     (
-        staged.write.format("jdbc")
+        staged.write
+        .format("jdbc")
         .option("url", PG_JDBC_URL)
         .option("dbtable", table_name)
+        .option("numPartitions", JDBC_WRITE_PARTITIONS)
         .options(**PG_PROPS)
         .mode("append")
         .save()
@@ -227,30 +250,16 @@ def run_pg_query(file_path: str = None, **kwargs):
 
     conn = pg_pool.getconn()
     try:
-        conn.autocommit = True
+        conn.autocommit = False
         with conn.cursor() as cur:
             cur.execute(query)
+        conn.commit()
+    except Exception:
+        logger.exception(f"SQL failed: {query}")
+        conn.rollback()
+        raise
     finally:
         pg_pool.putconn(conn)
-
-def truncate_staging_tables():
-    try:
-        logger.info("Truncating staging tables at startup")
-
-        run_pg_query(
-            file_path=SQL_PATH / "truncate_tables.sql",
-            tables=", ".join([
-                MARKET_TRADES_STAGING_TABLE,
-                TICKER_STAGING_TABLE,
-                CANDLES_STAGING_TABLE
-            ])
-        )
-
-        logger.info("Staging tables truncated successfully")
-
-    except Exception:
-        logger.exception("Failed to truncate staging tables")
-        raise
 
 
 # --- Schemas ---
@@ -322,6 +331,7 @@ try:
         .option("kafka.bootstrap.servers", BOOTSTRAP)
         .option("subscribe", TOPICS)
         .option("startingOffsets", "latest")
+        .option("maxOffsetsPerTrigger", SPARK_BATCHSIZE)
         .option("failOnDataLoss", False)
         .option("kafka.security.protocol", "SSL")
         .option("kafka.ssl.truststore.location", TRUSTSTORE)
@@ -339,18 +349,19 @@ except Exception:
 
 parsed = (
     raw.select(
-        col("topic"),
-        col("partition"),
         col("offset"),
         col("key").cast("string").alias("kafka_key"),
         from_json(col("value").cast("string"), topSchema).alias("j"),
     )
-    .select("topic", "partition", "offset", "kafka_key", "j.*")
+    .select("offset", "kafka_key", "j.*")
     .withColumn("message_ts_utc", parse_message_timestamp(col("timestamp")))
 )
 
 filtered = (
-    parsed.withColumn("event", col("events").getItem(0))
+    parsed
+    .where(col("events").isNotNull())
+    .where(size(col("events")) > 0)
+    .withColumn("event", col("events").getItem(0))
     .where(col("event").isNotNull())
     .where(col("event.type") == "update")       # Ignore snapshots
 )
@@ -362,11 +373,9 @@ def prepare_market_trades(batch_df):
     return (
         batch_df.withColumn("trades_arr", col("event.trades"))
         .where(col("trades_arr").isNotNull())
-        .select("topic", "kafka_key", "offset", explode(col("trades_arr")).alias("trade"))
+        .select("kafka_key", explode(col("trades_arr")).alias("trade"))
         .select(
-            col("topic"),
             col("kafka_key"),
-            col("offset").alias("kafka_offset"),
             col("trade.price").alias("price_str"),
             col("trade.product_id").alias("trade_product_id"),
             col("trade.side").alias("side"),
@@ -379,7 +388,7 @@ def prepare_market_trades(batch_df):
         .withColumn("size", col("size_str").cast("double"))
         .withColumn("trade_time_utc", to_timestamp(col("trade_time_str")))
         .withColumn("trade_value", expr("price * size"))
-        .drop("price_str", "size_str", "trade_time_str", "trade_product_id", "price")
+        .drop("price_str", "size_str", "trade_time_str", "trade_product_id", "price", "kafka_key")
     )
 
 
@@ -387,9 +396,8 @@ def prepare_tickers(batch_df):
     exploded = (
         batch_df.withColumn("ticker_arr", col("event.tickers"))
         .where(col("ticker_arr").isNotNull())
-        .select("topic", "kafka_key", "offset", "message_ts_utc", explode(col("ticker_arr")).alias("ticker"))
+        .select("kafka_key", "offset", "message_ts_utc", explode(col("ticker_arr")).alias("ticker"))
         .select(
-            col("topic"),
             col("kafka_key"),
             col("offset").alias("kafka_offset"),
             col("message_ts_utc"),
@@ -424,6 +432,7 @@ def prepare_tickers(batch_df):
             "high_24_h_str",
             "low_24_h_str",
             "ticker_product_id",
+            "kafka_key"
         )
     )
 
@@ -432,9 +441,8 @@ def prepare_candles(batch_df):
     exploded = (
         batch_df.withColumn("candles_arr", col("event.candles"))
         .where(col("candles_arr").isNotNull())
-        .select("topic", "kafka_key", "offset", "message_ts_utc", explode(col("candles_arr")).alias("candle"))
+        .select("kafka_key", "offset", "message_ts_utc", explode(col("candles_arr")).alias("candle"))
         .select(
-            col("topic"),
             col("kafka_key"),
             col("offset").alias("kafka_offset"),
             col("message_ts_utc"),
@@ -456,7 +464,7 @@ def prepare_candles(batch_df):
         .withColumn("volume", col("volume_str").cast("double"))
         .withColumn("range", expr("high - low"))
         .withColumn("avg_price", expr("(open + high + low + close) / 4"))
-        .drop("open_str", "high_str", "low_str", "close_str", "volume_str", "candle_product_id")
+        .drop("open_str", "high_str", "low_str", "close_str", "volume_str", "candle_product_id", "kafka_key")
     )
 
 
@@ -572,6 +580,12 @@ def process_batch(batch_df, batch_id):
     One micro-batch from the parsed Kafka stream.
     We persist because the batch is reused for trades, tickers, and candles.
     """
+
+    if shutdown_requested.is_set():
+        logger.info(f"Skipping batch {batch_id} due to shutdown")
+        return
+
+    batch_in_progress.set()
     batch_df = batch_df.persist(StorageLevel.MEMORY_AND_DISK)
     try:
         logger.info("Processing batch %s", batch_id)
@@ -580,84 +594,59 @@ def process_batch(batch_df, batch_id):
         tickers_df = prepare_tickers(batch_df)
         candles_df = prepare_candles(batch_df)
 
-        if not trades_df.rdd.isEmpty():
-            write_market_trades(trades_df, batch_id)
-        else:
-            logger.info("[market_trades] batch %s empty", batch_id)
+        write_market_trades(trades_df, batch_id)
+        write_ticker(tickers_df, batch_id)
+        write_candles(candles_df, batch_id)
 
-        if not tickers_df.rdd.isEmpty():
-            write_ticker(tickers_df, batch_id)
-        else:
-            logger.info("[ticker] batch %s empty", batch_id)
+    except Exception as e:
+        if shutdown_requested.is_set():
+            logger.info(f"Ignoring error during shutdown: {e}")
+            return
 
-        if not candles_df.rdd.isEmpty():
-            write_candles(candles_df, batch_id)
-        else:
-            logger.info("[candles] batch %s empty", batch_id)
-
-    except Exception:
-        logger.exception("Failed processing batch %s", batch_id)
+        logger.exception(f"Batch {batch_id} failed")
         raise
     finally:
         batch_df.unpersist()
+        batch_in_progress.clear()
 
 # -------------------------------------------------------------------
 # Main method
 # -------------------------------------------------------------------
 
 def main():
+    global query
+
+    signal.signal(signal.SIGINT, _request_shutdown)
+    signal.signal(signal.SIGTERM, _request_shutdown)
+
+    query = (
+        filtered.writeStream
+        .trigger(processingTime=PROCESSING_TIME)
+        .option("checkpointLocation", CHECKPOINT_DIR)
+        .foreachBatch(process_batch)
+        .start()
+    )
+
+    threading.Thread(target=_shutdown_watcher, daemon=True).start()
+
     try:
-        logger.info("Starting application")
-
-        # Step 1: clean staging tables
-        truncate_staging_tables()
-
-        # Step 2: start streaming query
-        query = (
-            filtered.writeStream
-            .trigger(processingTime=PROCESSING_TIME)
-            .option("checkpointLocation", CHECKPOINT_DIR)
-            .foreachBatch(process_batch)
-            .start()
-        )
-
-        logger.info("Streaming query started")
-
-        # Step 3: handle shutdown signals
-        signal.signal(signal.SIGINT, _request_shutdown)
-        signal.signal(signal.SIGTERM, _request_shutdown)
-
-        # Step 4: wait loop
-        logger.info("Streaming running...")
-        while not shutdown_requested.is_set():
-            try:
-                spark.streams.awaitAnyTermination(1)
-            except Py4JError:
-                if shutdown_requested.is_set():
-                    break
-                raise
-
-    except Exception:
-        logger.exception("Fatal error in main")
-        raise
-
+        query.awaitTermination()
     finally:
-        logger.info("Stopping streaming query")
-
         try:
-            if query and query.isActive:
+            if query is not None and query.isActive:
                 query.stop()
-        except (Py4JError, Py4JJavaError, Py4JNetworkError, ConnectionRefusedError):
-            logger.info("Query already stopped")
         except Exception:
             logger.exception("Error stopping query")
 
         try:
             spark.stop()
-        except (Py4JError, Py4JJavaError, Py4JNetworkError, ConnectionRefusedError):
-            logger.info("Spark already stopped")
         except Exception:
             logger.exception("Error stopping Spark")
+
+        try:
+            pg_pool.closeall()
+        except Exception:
+            logger.exception("Error closing PostgreSQL pool")
 
 if __name__ == "__main__":
     main()
