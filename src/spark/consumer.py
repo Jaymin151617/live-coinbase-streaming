@@ -8,14 +8,12 @@ import threading
 from pathlib import Path
 from functools import lru_cache
 
-from py4j.protocol import Py4JError, Py4JJavaError, Py4JNetworkError
 from psycopg2 import pool
 from pyspark import StorageLevel
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import (
     col,
     coalesce,
-    count as _count,
     date_trunc,
     explode,
     expr,
@@ -24,10 +22,7 @@ from pyspark.sql.functions import (
     row_number,
     round as _round,
     size,
-    sum as _sum,
     to_timestamp,
-    when,
-    current_timestamp,
 )
 from pyspark.sql.types import (
     ArrayType,
