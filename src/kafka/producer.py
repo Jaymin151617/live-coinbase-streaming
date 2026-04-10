@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 from typing import Tuple
 import calendar
+from logging.handlers import TimedRotatingFileHandler
 
 from coinbase import jwt_generator
 from confluent_kafka import Producer, KafkaException
@@ -58,13 +59,40 @@ REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 30000))
 # Logging
 (ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    filename=ROOT_DIR / "logs" / "producer.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s %(message)s",
+log_file = ROOT_DIR / "logs" / "producer.log"
+
+# Create rotating handler (weekly rotation)
+file_handler = TimedRotatingFileHandler(
+    filename=log_file,
+    when="W0",          # rotate every Monday
+    interval=1,
+    backupCount=4,      # keep last 4 weeks
+    encoding="utf-8"
 )
-# enable kafka-python logs
+
+# Format
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(threadName)s %(message)s"
+)
+file_handler.setFormatter(formatter)
+
+# Optional: also log to console (recommended for Docker)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+
+# Root logger setup
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Avoid duplicate handlers if reloaded
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+# Kafka logs level
 logging.getLogger("kafka").setLevel(logging.INFO)
+
+# Your app logger
 logger = logging.getLogger("cb-kafka-bridge")
 
 # --- Load secrets ---
