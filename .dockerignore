@@ -1,0 +1,34 @@
+# Git
+.git
+.gitignore
+
+# Docs
+README.md
+LICENSE
+
+# Unused modules
+src/spark
+src/sql
+unused/
+
+# Runtime data
+logs/
+checkpoints/
+
+# Secrets & env (CRITICAL)
+secrets/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+
+# OS junk
+.DS_Store
+Thumbs.db

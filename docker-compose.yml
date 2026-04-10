@@ -1,0 +1,15 @@
+services:
+  producer:
+    build:
+      context: .                # project root
+      dockerfile: src/kafka/Dockerfile
+    container_name: kafka-producer
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./secrets:/app/secrets
+      - ./logs:/app/logs
+
+    restart: unless-stopped
