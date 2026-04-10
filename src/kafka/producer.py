@@ -23,26 +23,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Tuple
+import calendar
 
 from coinbase import jwt_generator
 from confluent_kafka import Producer, KafkaException
 import websocket
-
-# --- Configuration ---
-PRODUCTS = [
-    "BTC-USD",     # Bitcoin
-    "ETH-USD",     # Ethereum
-    "LINK-USD",    # Chainlink
-    "SOL-USD",     # Solana
-    "ADA-USD"      # Cardano
-]
-
-CHANNELS = [
-    "ticker",
-    "candles",
-    "market_trades",
-    # "heartbeats"     # Required in production to verify sequence of messages
-]
 
 # Paths
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -52,20 +37,23 @@ COINBASE_SECRET_KEY_PATH = ROOT_DIR / "secrets" / "cb_secret_key.pem"
 KAFKA_CA_PATH = ROOT_DIR / "secrets" / "kafka_ca.pem"
 KAFKA_SERVICE_CERT_PATH = ROOT_DIR / "secrets" / "kafka_service.cert"
 KAFKA_SERVICE_KEY_PATH = ROOT_DIR / "secrets" / "kafka_service.key"
+CONFIG_PATH = ROOT_DIR / "src" / "config.json"
 
 # Kafka cluster address
 KAFKA_SERVER_URL = os.environ.get("KAFKA_SERVER_URL")
-COINBASE_WEBSOCKET_URL = "wss://advanced-trade-ws.coinbase.com"
+COINBASE_WEBSOCKET_URL = os.environ.get("COINBASE_WEBSOCKET_URL")
 
 # Performance / reliability tuning
-SO_RCVBUF_BYTES = 4 * 1024 * 1024   # 4MB receive buffer
-MESSAGE_QUEUE_MAXSIZE = 50_000      # bounded queue for backpressure
-WORKER_COUNT = 2                    # number of kafka sender threads
-BATCH_SIZE = 500                    # messages per batch (worker)
-LINGER_MS = 50                      # ms to wait for a batch before send
-KAFKA_BATCH_BYTES = 256 * 1024      # broker-side batch size hint (bytes)
-KAFKA_RETRIES = 5
-QUEUE_PUT_TIMEOUT = 0.005           # seconds to attempt enqueue
+SO_RCVBUF_BYTES = int(os.environ.get("SO_RCVBUF_BYTES", 4 * 1024 * 1024))         # 4MB receive buffer
+MESSAGE_QUEUE_MAXSIZE = int(os.environ.get("MESSAGE_QUEUE_MAXSIZE", 50_000))      # bounded queue for backpressure
+WORKER_COUNT = int(os.environ.get("WORKER_COUNT", 2))                             # number of kafka sender threads
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 500))                               # messages per batch (worker)
+LINGER_MS = int(os.environ.get("LINGER_MS", 50))                                  # ms to wait for a batch before send
+KAFKA_BATCH_BYTES = int(os.environ.get("KAFKA_BATCH_BYTES", 256 * 1024))          # broker-side batch size hint (bytes)
+KAFKA_RETRIES = int(os.environ.get("KAFKA_RETRIES", 5))
+QUEUE_PUT_TIMEOUT = int(os.environ.get("QUEUE_PUT_TIMEOUT", 0.005))               # seconds to attempt enqueue
+RETRY_BACKOFF = int(os.environ.get("RETRY_BACKOFF", 1000))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 30000))
 
 # Logging
 (ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
@@ -91,6 +79,31 @@ except FileNotFoundError:
 
 if not KAFKA_SERVER_URL:
     logger.error("KAFKA_SERVER_URL environment variable is not set.")
+    sys.exit(1)
+
+# --- Configuration ---
+try:
+    with open(CONFIG_PATH, "r") as cfg:
+        CONFIG = json.load(cfg)
+
+    PRODUCTS = [
+        product["symbol"]
+        for product in CONFIG["products"]
+        if product.get("enabled", False)
+    ]
+
+    CHANNELS = list(CONFIG["channels"].keys())
+
+except FileNotFoundError:
+    logger.exception("Config file not found.")
+    sys.exit(1)
+
+except json.JSONDecodeError:
+    logger.exception("Invalid JSON in config file.")
+    sys.exit(1)
+
+except KeyError:
+    logger.exception("Config file in wrong format.")
     sys.exit(1)
 
 
@@ -126,8 +139,8 @@ producer_conf = {
     "acks": "all",
     "retries": KAFKA_RETRIES,
     "enable.idempotence": True,
-    "retry.backoff.ms": 1000,
-    "request.timeout.ms": 30000,
+    "retry.backoff.ms": RETRY_BACKOFF,
+    "request.timeout.ms": REQUEST_TIMEOUT,
     "linger.ms": LINGER_MS,
     "batch.size": KAFKA_BATCH_BYTES,
 }
@@ -140,7 +153,7 @@ except Exception:
 
 
 # Shared queue for messages from all websocket threads
-msg_queue: "queue.Queue[Tuple[str, str, str]]" = queue.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
+msg_queue: "queue.Queue[Tuple[str, str, str, int]]" = queue.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
 
 # A simple counter for dropped messages
 dropped_messages = 0
@@ -170,7 +183,7 @@ def serialize_value(value):
     return value
 
 
-def _produce_with_retry(topic: str, product: str, msg: str) -> bool:
+def _produce_with_retry(topic: str, product: str, msg: str, event_ts_ms: int) -> bool:
 
     for _ in range(3):
         try:
@@ -178,6 +191,7 @@ def _produce_with_retry(topic: str, product: str, msg: str) -> bool:
                 topic=topic,
                 key=serialize_key(product),
                 value=serialize_value(msg),
+                timestamp=event_ts_ms,
                 on_delivery=delivery_report,
             )
             producer.poll(0)  # serve delivery callbacks
@@ -196,8 +210,8 @@ def _produce_with_retry(topic: str, product: str, msg: str) -> bool:
 
 
 def _drain_batch(batch):
-    for topic, product, msg in batch:
-        _produce_with_retry(topic, product, msg)
+    for topic, product, msg, epoch in batch:
+        _produce_with_retry(topic, product, msg, epoch)
 
 
 def kafka_worker(worker_id: int):
@@ -260,6 +274,40 @@ def fast_extract_channel(msg: str):
     end = msg.find('"', start)
     return msg[start:end]
 
+def fast_extract_timestamp(msg: str):
+    i = msg.find('"timestamp":"')
+    if i == -1:
+        return None
+    start = i + 13
+    end = msg.find('"', start)
+    return msg[start:end]
+
+def to_epoch_ms(ts_str: str):
+    try:
+        year = int(ts_str[0:4])
+        month = int(ts_str[5:7])
+        day = int(ts_str[8:10])
+
+        hour = int(ts_str[11:13])
+        minute = int(ts_str[14:16])
+        second = int(ts_str[17:19])
+
+        # Extract milliseconds
+        ms = 0
+        if '.' in ts_str:
+            frac = ts_str[20:]
+            frac = frac.replace('Z', '').split('+')[0]
+            ms = int(frac[:3].ljust(3, '0'))
+
+        epoch_sec = calendar.timegm((
+            year, month, day,
+            hour, minute, second
+        ))
+
+        return epoch_sec * 1000 + ms
+
+    except Exception:
+        return int(time.time() * 1000)
 
 # --- WebSocket callbacks factory (per-product) ---
 def make_callbacks(product: str):
@@ -281,9 +329,13 @@ def make_callbacks(product: str):
 
             channel = fast_extract_channel(text)
             topic = _sanitize_topic(str(channel))
+
+            ts_str = fast_extract_timestamp(text)
+            event_ts_ms = to_epoch_ms(ts_str)
+
             # Enqueue with non-blocking put and tiny timeout to avoid blocking websocket thread
             try:
-                msg_queue.put((topic, product, text), timeout=QUEUE_PUT_TIMEOUT)
+                msg_queue.put((topic, product, text, event_ts_ms), timeout=QUEUE_PUT_TIMEOUT)
             except queue.Full:
                 # drop message if queue full (log sampling to avoid floods)
                 with dropped_lock:

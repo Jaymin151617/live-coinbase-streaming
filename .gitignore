@@ -14,6 +14,7 @@ data/
 
 # Spark Checkpoints
 tmp/
+checkpoints/
 
 # Secrets
 secrets/
