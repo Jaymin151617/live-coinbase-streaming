@@ -44,16 +44,16 @@ KAFKA_SERVER_URL = os.environ.get("KAFKA_SERVER_URL")
 COINBASE_WEBSOCKET_URL = os.environ.get("COINBASE_WEBSOCKET_URL")
 
 # Performance / reliability tuning
-SO_RCVBUF_BYTES = 4 * 1024 * 1024   # 4MB receive buffer
-MESSAGE_QUEUE_MAXSIZE = 50_000      # bounded queue for backpressure
-WORKER_COUNT = 2                    # number of kafka sender threads
-BATCH_SIZE = 500                    # messages per batch (worker)
-LINGER_MS = 50                      # ms to wait for a batch before send
-KAFKA_BATCH_BYTES = 256 * 1024      # broker-side batch size hint (bytes)
-KAFKA_RETRIES = 5
-QUEUE_PUT_TIMEOUT = 0.005           # seconds to attempt enqueue
-RETRY_BACKOFF = 1000
-REQUEST_TIMEOUT = 30000
+SO_RCVBUF_BYTES = int(os.environ.get("SO_RCVBUF_BYTES", 4 * 1024 * 1024))         # 4MB receive buffer
+MESSAGE_QUEUE_MAXSIZE = int(os.environ.get("MESSAGE_QUEUE_MAXSIZE", 50_000))      # bounded queue for backpressure
+WORKER_COUNT = int(os.environ.get("WORKER_COUNT", 2))                             # number of kafka sender threads
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 500))                               # messages per batch (worker)
+LINGER_MS = int(os.environ.get("LINGER_MS", 50))                                  # ms to wait for a batch before send
+KAFKA_BATCH_BYTES = int(os.environ.get("KAFKA_BATCH_BYTES", 256 * 1024))          # broker-side batch size hint (bytes)
+KAFKA_RETRIES = int(os.environ.get("KAFKA_RETRIES", 5))
+QUEUE_PUT_TIMEOUT = int(os.environ.get("QUEUE_PUT_TIMEOUT", 0.005))               # seconds to attempt enqueue
+RETRY_BACKOFF = int(os.environ.get("RETRY_BACKOFF", 1000))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 30000))
 
 # Logging
 (ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
