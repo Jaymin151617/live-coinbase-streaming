@@ -23,6 +23,7 @@ from pyspark.sql.functions import (
     round as _round,
     size,
     to_timestamp,
+    to_utc_timestamp
 )
 from pyspark.sql.types import (
     ArrayType,
@@ -382,6 +383,10 @@ def prepare_market_trades(batch_df):
         .withColumn("price", col("price_str").cast("double"))
         .withColumn("size", col("size_str").cast("double"))
         .withColumn("trade_time_utc", to_timestamp(col("trade_time_str")))
+        .withColumn(
+            "trade_time_utc",
+            to_utc_timestamp("trade_time_utc", "UTC")
+        )
         .withColumn("trade_value", expr("price * size"))
         .drop("price_str", "size_str", "trade_time_str", "trade_product_id", "price", "kafka_key")
     )
@@ -524,6 +529,10 @@ def write_ticker(batch_df, batch_id):
         .withColumn("high_24h", _round(coalesce(col("high_24h"), lit(0.0)), 4))
         .withColumn("low_24h", _round(coalesce(col("low_24h"), lit(0.0)), 4))
         .withColumn("ticker_ts_utc", col("minute_bucket"))
+        .withColumn(
+            "ticker_ts_utc",
+            to_utc_timestamp("ticker_ts_utc", "UTC")
+        )
         .drop("minute_bucket")
     )
 
@@ -556,6 +565,10 @@ def write_candles(batch_df, batch_id):
         .withColumn("range", _round(coalesce(col("range"), lit(0.0)), 4))
         .withColumn("avg_price", _round(coalesce(col("avg_price"), lit(0.0)), 4))
         .withColumn("candle_ts_utc", col("minute_bucket"))
+        .withColumn(
+            "candle_ts_utc",
+            to_utc_timestamp("candle_ts_utc", "UTC")
+        )
         .drop("minute_bucket")
     )
 
