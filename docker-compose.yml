@@ -1,15 +1,40 @@
 services:
   producer:
     build:
-      context: .                # project root
+      context: .
       dockerfile: src/kafka/Dockerfile
     container_name: kafka-producer
-
     env_file:
       - .env
-
     volumes:
       - ./secrets:/app/secrets
       - ./logs:/app/logs
-
     restart: unless-stopped
+
+  metabase:
+    image: metabase/metabase
+    container_name: metabase
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17
+    container_name: my_postgres
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c max_connections=${POSTGRES_MAX_CONNECTIONS}
+      -c shared_buffers=${POSTGRES_SHARED_BUFFERS}
+      -c work_mem=${POSTGRES_WORK_MEM}
+
+volumes:
+  pgdata:

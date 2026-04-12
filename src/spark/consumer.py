@@ -60,8 +60,6 @@ SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "1g")
 SPARK_EXECUTOR_MEMORY = os.environ.get("SPARK_EXECUTOR_MEMORY", "1g")
 SPARK_CHECKPOINTS_TO_RETAIN = os.environ.get("SPARK_CHECKPOINTS_TO_RETAIN", "10")
 
-TOPICS = "coinbase.ticker,coinbase.candles,coinbase.market_trades"
-
 KEYSTORE = os.environ.get("KEYSTORE")
 KEYSTORE_PASS = os.environ.get("KEYSTORE_PASS")
 KEYSTORE_TYPE = os.environ.get("KEYSTORE_TYPE")
@@ -146,7 +144,7 @@ pg_pool = pool.SimpleConnectionPool(
     database=PG_DATABASE,
     user=PG_USERNAME,
     password=PG_PASSWORD,
-    sslmode="require",
+    # sslmode="require",
 )
 
 try:
@@ -196,7 +194,7 @@ def parse_message_timestamp(ts_col):
         to_timestamp(ts_col, "yyyy-MM-dd'T'HH:mm:ss.SSSSSSX")
     )
 
-PG_JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DATABASE}?sslmode=require"
+PG_JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
 PG_PROPS = {
     "user": PG_USERNAME,
     "password": PG_PASSWORD,
