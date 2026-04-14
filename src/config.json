@@ -12,8 +12,7 @@
     {"name": "bitcoin", "symbol": "BTC-USD", "enabled": true},
     {"name": "ethereum", "symbol": "ETH-USD", "enabled": true},
     {"name": "chainlink", "symbol": "LINK-USD", "enabled": true},
-    {"name": "solana", "symbol": "SOL-USD", "enabled": true},
-    {"name": "cardano", "symbol": "ADA-USD", "enabled": true}
+    {"name": "solana", "symbol": "SOL-USD", "enabled": true}
   ],
 
   "tables": {
