@@ -6,18 +6,32 @@ services:
     container_name: kafka-producer
     env_file:
       - .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 768m
+    cpus: 1.0
     volumes:
       - ./secrets:/app/secrets
       - ./logs:/app/logs
     restart: unless-stopped
 
   metabase:
-    image: metabase/metabase
+    image: metabase/metabase:latest
     container_name: metabase
     ports:
       - "3000:3000"
     env_file:
       - .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 1g
+    cpus: 1.0
     restart: unless-stopped
 
   postgres:
@@ -26,6 +40,13 @@ services:
     restart: always
     env_file:
       - .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 768m
+    cpus: 0.75
     ports:
       - "${POSTGRES_PORT}:5432"
     volumes:
@@ -35,6 +56,7 @@ services:
       -c max_connections=${POSTGRES_MAX_CONNECTIONS}
       -c shared_buffers=${POSTGRES_SHARED_BUFFERS}
       -c work_mem=${POSTGRES_WORK_MEM}
+      -c effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE}
 
 volumes:
   pgdata:
