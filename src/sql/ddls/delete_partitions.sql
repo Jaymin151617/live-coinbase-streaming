@@ -4,7 +4,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_cutoff timestamptz :=
-    date_trunc('hour', now() AT TIME ZONE 'UTC') - interval '1 day';
+    date_trunc('hour', now() AT TIME ZONE 'UTC') - interval '1 hour';
     v_parent text;
     v_part record;
     v_suffix text;
