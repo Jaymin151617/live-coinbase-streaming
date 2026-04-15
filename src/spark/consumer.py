@@ -124,15 +124,15 @@ try:
     MARKET_TRADES_FINAL_TABLE   = TABLES['market_trades']['final']
 
 except FileNotFoundError:
-    logger.exception("Config file not found.")
+    logger.exception("config_file_not_found path=%s", CONFIG_PATH)
     sys.exit(1)
 
 except json.JSONDecodeError:
-    logger.exception("Invalid JSON in config file.")
+    logger.exception("config_invalid_json path=%s", CONFIG_PATH)
     sys.exit(1)
 
 except KeyError:
-    logger.exception("Config file in wrong format.")
+    logger.exception("config_invalid_format path=%s", CONFIG_PATH)
     sys.exit(1)
 
 
@@ -143,8 +143,7 @@ pg_pool = pool.SimpleConnectionPool(
     port=PG_PORT,
     database=PG_DATABASE,
     user=PG_USERNAME,
-    password=PG_PASSWORD,
-    # sslmode="require",
+    password=PG_PASSWORD
 )
 
 try:
@@ -159,9 +158,9 @@ try:
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
-    logger.info("Spark session started")
+    logger.info("spark_session_started app=spark-consumer")
 except Exception:
-    logger.exception("Failed to initialize SparkSession")
+    logger.exception("spark_session_init_failed")
     raise
 
 
@@ -171,7 +170,7 @@ query = None
 
 
 def _request_shutdown(signum, frame):
-    logger.info("Received signal %s; will stop after current micro-batch", signum)
+    logger.info("shutdown_signal_received signal=%s", signum)
     shutdown_requested.set()
 
 def _shutdown_watcher():
@@ -184,7 +183,7 @@ def _shutdown_watcher():
 
     global query
     if query is not None and query.isActive:
-        logger.info("Stopping query cleanly at batch boundary")
+        logger.info("stopping_query_at_batch_boundary")
         query.stop()
 
 
@@ -204,19 +203,28 @@ PG_PROPS = {
 
 def jdbc_write(df, table_name):
 
-    # Always control partitions explicitly
+    logger.debug("jdbc_write_started table=%s partitions=%d",
+                 table_name, JDBC_WRITE_PARTITIONS)
+
     staged = df.repartition(JDBC_WRITE_PARTITIONS)
 
-    (
-        staged.write
-        .format("jdbc")
-        .option("url", PG_JDBC_URL)
-        .option("dbtable", table_name)
-        .option("numPartitions", JDBC_WRITE_PARTITIONS)
-        .options(**PG_PROPS)
-        .mode("append")
-        .save()
-    )
+    try:
+        (
+            staged.write
+            .format("jdbc")
+            .option("url", PG_JDBC_URL)
+            .option("dbtable", table_name)
+            .option("numPartitions", JDBC_WRITE_PARTITIONS)
+            .options(**PG_PROPS)
+            .mode("append")
+            .save()
+        )
+
+        logger.debug("jdbc_write_completed table=%s", table_name)
+
+    except Exception:
+        logger.exception("jdbc_write_failed table=%s", table_name)
+        raise
 
 # Cache SQL files to avoid repeated disk reads
 @lru_cache(maxsize=10)
@@ -224,14 +232,14 @@ def load_sql(file_path: str) -> str:
     path = Path(file_path)
 
     if not path.exists():
-        logger.exception(f"SQL file not found: {file_path}")
+        logger.exception("sql_file_not_found path=%s", file_path)
         sys.exit(1)
 
     try:
         with open(path, "r") as f:
             return f.read()
     except Exception:
-        logger.exception(f"Failed to read SQL file: {file_path}")
+        logger.exception("sql_file_read_failed path=%s", file_path)
         sys.exit(1)
 
 def run_pg_query(file_path: str = None, **kwargs):
@@ -249,7 +257,7 @@ def run_pg_query(file_path: str = None, **kwargs):
             cur.execute(query)
         conn.commit()
     except Exception:
-        logger.exception(f"SQL failed: {query}")
+        logger.exception("sql_execution_failed path=%s", file_path)
         conn.rollback()
         raise
     finally:
@@ -336,9 +344,14 @@ try:
         .option("kafka.ssl.key.password", KEYSTORE_PASS)
         .load()
     )
-    logger.info("Kafka stream configured for topics: %s", TOPICS)
+    logger.info(
+        "kafka_stream_configured topics=%s batch_size=%s trigger=%s",
+        TOPICS,
+        SPARK_BATCHSIZE,
+        PROCESSING_TIME
+    )
 except Exception:
-    logger.exception("Failed to configure Kafka read stream")
+    logger.exception("kafka_stream_configuration_failed")
     raise
 
 parsed = (
@@ -491,7 +504,7 @@ def write_market_trades(batch_df, batch_id):
         final_table=MARKET_TRADES_FINAL_TABLE,
     )
 
-    logger.debug("[market_trades] batch %s results:", batch_id)
+    logger.debug("market_trades_batch_written batch_id=%s", batch_id)
 
 
 def write_ticker(batch_df, batch_id):
@@ -542,7 +555,7 @@ def write_ticker(batch_df, batch_id):
         final_table=TICKER_FINAL_TABLE
     )
 
-    logger.debug("[ticker] batch %s results:", batch_id)
+    logger.debug("ticker_batch_written batch_id=%s", batch_id)
 
 
 def write_candles(batch_df, batch_id):
@@ -578,7 +591,7 @@ def write_candles(batch_df, batch_id):
         final_table=CANDLES_FINAL_TABLE
     )
 
-    logger.debug("[candles] batch %s results:", batch_id)
+    logger.debug("candles_batch_written batch_id=%s", batch_id)
 
 
 def process_batch(batch_df, batch_id):
@@ -588,13 +601,13 @@ def process_batch(batch_df, batch_id):
     """
 
     if shutdown_requested.is_set():
-        logger.info(f"Skipping batch {batch_id} due to shutdown")
+        logger.info("batch_skipped_during_shutdown batch_id=%s", batch_id)
         return
 
     batch_in_progress.set()
     batch_df = batch_df.persist(StorageLevel.MEMORY_AND_DISK)
     try:
-        logger.info("Processing batch %s", batch_id)
+        logger.info("batch_processing_started batch_id=%s", batch_id)
 
         trades_df = prepare_market_trades(batch_df)
         tickers_df = prepare_tickers(batch_df)
@@ -604,12 +617,14 @@ def process_batch(batch_df, batch_id):
         write_ticker(tickers_df, batch_id)
         write_candles(candles_df, batch_id)
 
+        logger.info("batch_processing_completed batch_id=%s", batch_id)
+
     except Exception as e:
         if shutdown_requested.is_set():
-            logger.info(f"Ignoring error during shutdown: {e}")
+            logger.info("batch_error_ignored_during_shutdown batch_id=%s error=%s", batch_id, e)
             return
 
-        logger.exception(f"Batch {batch_id} failed")
+        logger.exception("batch_failed batch_id=%s", batch_id)
         raise
     finally:
         batch_df.unpersist()
@@ -642,17 +657,19 @@ def main():
             if query is not None and query.isActive:
                 query.stop()
         except Exception:
-            logger.exception("Error stopping query")
+            logger.exception("query_stop_failed")
 
         try:
             spark.stop()
         except Exception:
-            logger.exception("Error stopping Spark")
+            logger.exception("spark_stop_failed")
 
         try:
             pg_pool.closeall()
         except Exception:
-            logger.exception("Error closing PostgreSQL pool")
+            logger.exception("postgres_pool_close_failed")
+
+        logger.info("shutdown_complete")
 
 if __name__ == "__main__":
     main()
