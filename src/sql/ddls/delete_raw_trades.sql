@@ -5,7 +5,8 @@ BEGIN
         SELECT trade_id
         FROM coinbase.raw_market_trades
         WHERE trade_time_utc < NOW() - INTERVAL '1 hour'
-        LIMIT 5000
+        ORDER BY trade_time_utc
+        LIMIT 10000
     )
     DELETE FROM coinbase.raw_market_trades
     WHERE trade_id IN (SELECT trade_id FROM to_delete);
