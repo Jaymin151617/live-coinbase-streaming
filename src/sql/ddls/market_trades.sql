@@ -18,6 +18,9 @@ CREATE TABLE coinbase.raw_market_trades (
     inserted_at_utc     timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE INDEX idx_raw_market_trades_trade_time
+ON coinbase.raw_market_trades (trade_time_utc);
+
 CREATE TABLE coinbase.market_trades_agg (
     product_id TEXT NOT NULL,
     trade_time_utc TIMESTAMPTZ NOT NULL,
