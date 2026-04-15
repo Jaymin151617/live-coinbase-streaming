@@ -7,6 +7,7 @@ import signal
 import threading
 from pathlib import Path
 from functools import lru_cache
+from logging.handlers import TimedRotatingFileHandler
 
 from psycopg2 import pool
 from pyspark import StorageLevel
@@ -44,12 +45,26 @@ SQL_PATH = ROOT_DIR / "src" / "sql"
 (ROOT_DIR / "logs").mkdir(parents=True, exist_ok=True)
 (ROOT_DIR / "checkpoints" / "coinbase_consumer").mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    filename=ROOT_DIR / "logs" / "consumer.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+LOG_FILE = ROOT_DIR / "logs" / "consumer.log"
+SPARK_LOG_FILE = ROOT_DIR / "logs" / "spark.log"
+
+handler = TimedRotatingFileHandler(
+    filename=LOG_FILE,
+    when="midnight",     # rotate daily
+    interval=1,
+    backupCount=2        # keep last 2 days
 )
+
+formatter = logging.Formatter(
+    "%(asctime)s level=%(levelname)s %(message)s"
+)
+handler.setFormatter(formatter)
+
 logger = logging.getLogger("spark-consumer")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    logger.addHandler(handler)
 
 # -------------------------------------------------------------------
 # config via env vars
@@ -93,6 +108,10 @@ required_env = {
 }
 missing_env = [name for name, value in required_env.items() if not value]
 if missing_env:
+    logger.error(
+        "startup_validation_failed missing_env_vars=%s",
+        ",".join(missing_env)
+    )
     raise ValueError(f"Missing required environment variables: {', '.join(missing_env)}")
 
 # --- Configuration ---
