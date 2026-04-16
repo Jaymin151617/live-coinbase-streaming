@@ -87,7 +87,7 @@ PG_DATABASE = os.environ.get("PG_DATABASE")
 PG_USERNAME = os.environ.get("PG_USERNAME")
 PG_PASSWORD = os.environ.get("PG_PASSWORD")
 
-PROCESSING_TIME = os.environ.get("PROCESSING_TIME", "30 seconds")
+PROCESSING_TIME = os.environ.get("PROCESSING_TIME", "43 seconds")
 SPARK_BATCHSIZE = os.environ.get("SPARK_BATCHSIZE", "2000")
 CHECKPOINT_DIR = str(ROOT_DIR / "checkpoints" / "coinbase_consumer")
 JDBC_WRITE_PARTITIONS = int(os.environ.get("JDBC_WRITE_PARTITIONS", "4"))
