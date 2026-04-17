@@ -1,56 +1,125 @@
+# ==============================================================================
+# Docker Compose Configuration
+# Purpose: Orchestrates Kafka producer, Metabase (BI), and PostgreSQL services
+# ==============================================================================
+
 services:
+
+  # ----------------------------------------------------------------------------
+  # Kafka Producer Service
+  # ----------------------------------------------------------------------------
+  # Purpose:
+  # - Runs the Coinbase → Kafka ingestion pipeline
+  # - Built from local Dockerfile
+  # - Uses mounted secrets and logs for runtime configuration
+
   producer:
     build:
-      context: .
-      dockerfile: src/kafka/Dockerfile
+      context: .                         # Root of project as build context
+      dockerfile: src/kafka/Dockerfile   # Custom Dockerfile for producer
     container_name: kafka-producer
+
+    # Load environment variables (e.g., Kafka URL, Coinbase WS URL)
     env_file:
       - .env
+
+    # Logging configuration (rotating logs to prevent disk exhaustion)
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    mem_limit: 768m
-    cpus: 1.0
+
+    # Resource limits (important for stability)
+    mem_limit: 512m
+    cpus: 0.5
+
+    # Mount secrets and logs from host
     volumes:
-      - ./secrets:/app/secrets
-      - ./logs:/app/logs
+      - ./secrets:/app/secrets     # API keys, certs (NOT baked into image)
+      - ./logs:/app/logs           # Runtime logs persisted outside container
+
+    # Restart policy for resilience
     restart: unless-stopped
+
+
+  # ----------------------------------------------------------------------------
+  # Metabase Service (BI / Dashboard Layer)
+  # ----------------------------------------------------------------------------
+  # Purpose:
+  # - Provides UI for querying and visualizing PostgreSQL data
+  # - Connects to the same database used by ingestion pipeline
 
   metabase:
     image: metabase/metabase:latest
     container_name: metabase
+
+    # Ensures that the 'postgres' service is started before this service.
+    depends_on:
+      - postgres
+
+    # Expose Metabase UI on host
     ports:
       - "3000:3000"
+
+    # Environment variables (DB connection, configs)
     env_file:
       - .env
+
+    # Logging configuration
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+    # Resource constraints
     mem_limit: 1g
     cpus: 1.0
+
+    # Restart policy
     restart: unless-stopped
+
+
+  # ----------------------------------------------------------------------------
+  # PostgreSQL Service (Primary Data Store)
+  # ----------------------------------------------------------------------------
+  # Purpose:
+  # - Stores raw, aggregated, and snapshot market data
+  # - Backed by persistent volume
 
   postgres:
     image: postgres:17
     container_name: my_postgres
+
+    # Always restart for database reliability
     restart: always
+
+    # Load DB credentials and config from .env
     env_file:
       - .env
+
+    # Logging configuration
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    mem_limit: 768m
-    cpus: 0.75
+
+    # Resource limits (tuned for moderate workload)
+    mem_limit: 1g
+    cpus: 1.0
+
+    # Expose PostgreSQL port dynamically via environment variable
     ports:
       - "${POSTGRES_PORT}:5432"
+
+    # Persistent storage for database data
     volumes:
       - pgdata:/var/lib/postgresql/data
+
+    # PostgreSQL runtime tuning parameters
+    # These are injected from environment variables for flexibility
     command: >
       postgres
       -c max_connections=${POSTGRES_MAX_CONNECTIONS}
@@ -58,5 +127,10 @@ services:
       -c work_mem=${POSTGRES_WORK_MEM}
       -c effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE}
 
+
+# ------------------------------------------------------------------------------
+# Named Volumes
+# ------------------------------------------------------------------------------
+# Persistent storage managed by Docker
 volumes:
   pgdata:
