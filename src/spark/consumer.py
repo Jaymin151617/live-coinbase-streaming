@@ -110,14 +110,15 @@ from logging.handlers import TimedRotatingFileHandler  # Log rotation (daily log
 # ---------------------------------------------------------------------
 # Database (PostgreSQL)
 # ---------------------------------------------------------------------
-from psycopg2 import pool                     # Connection pooling for PostgreSQL
+from psycopg2 import pool                                # Connection pooling for PostgreSQL
 
 
 # ---------------------------------------------------------------------
 # Spark (Distributed Processing)
 # ---------------------------------------------------------------------
-from pyspark import StorageLevel              # Persistence levels for DataFrames
-from pyspark.sql import SparkSession, Window  # Spark entry point and window functions
+from pyspark import StorageLevel                         # Persistence levels for DataFrames
+from pyspark.sql import SparkSession, DataFrame, Window  # Spark entry point, dataframe and window functions
+from pyspark.sql.column import Column                    # Spark dataframe column type
 
 
 # ---------------------------------------------------------------------
@@ -478,7 +479,7 @@ topSchema = StructType(
 # Core Functions
 # =====================================================================
 
-def prepare_market_trades(batch_df):
+def prepare_market_trades(batch_df: DataFrame) -> DataFrame:
     """
     Extract and transform trade-level data from a Spark micro-batch.
 
@@ -562,7 +563,7 @@ def prepare_market_trades(batch_df):
     )
 
 
-def prepare_tickers(batch_df):
+def prepare_tickers(batch_df: DataFrame) -> DataFrame:
     """
     Extract and transform ticker-level data from a Spark micro-batch.
 
@@ -665,7 +666,7 @@ def prepare_tickers(batch_df):
     )
 
 
-def prepare_candles(batch_df):
+def prepare_candles(batch_df: DataFrame) -> DataFrame:
     """
     Extract and transform candle (OHLCV) data from a Spark micro-batch.
 
@@ -760,7 +761,7 @@ def prepare_candles(batch_df):
     )
 
 
-def write_market_trades(batch_df, batch_id):
+def write_market_trades(batch_df: DataFrame, batch_id: int) -> None:
     """
     Write trade data to PostgreSQL using staging + upsert pattern.
 
@@ -788,7 +789,7 @@ def write_market_trades(batch_df, batch_id):
     """
 
     # Deduplicate trades within batch
-    raw_out = (
+    raw_out: DataFrame = (
         batch_df.select(
             "trade_id",
             "product_id",
@@ -814,7 +815,7 @@ def write_market_trades(batch_df, batch_id):
     logger.debug("market_trades_batch_written batch_id=%s", batch_id)
 
 
-def write_ticker(batch_df, batch_id):
+def write_ticker(batch_df: DataFrame, batch_id: int) -> None:
     """
     Write ticker data to PostgreSQL with per-minute deduplication.
 
@@ -844,7 +845,7 @@ def write_ticker(batch_df, batch_id):
     w = Window.partitionBy("product_id", "minute_bucket") \
               .orderBy(col("kafka_offset").desc())
 
-    latest = (
+    latest: DataFrame = (
         batch_df
         .withColumn("minute_bucket", date_trunc("minute", col("message_ts_utc")))
         .withColumn("rn", row_number().over(w))
@@ -853,7 +854,7 @@ def write_ticker(batch_df, batch_id):
     )
 
     # Normalize values and prepare output
-    out = (
+    out: DataFrame = (
         latest.select(
             "product_id",
             "price",
@@ -898,7 +899,7 @@ def write_ticker(batch_df, batch_id):
     logger.debug("ticker_batch_written batch_id=%s", batch_id)
 
 
-def write_candles(batch_df, batch_id):
+def write_candles(batch_df: DataFrame, batch_id: int) -> None:
     """
     Write candle (OHLCV) data to PostgreSQL with per-minute deduplication.
 
@@ -928,7 +929,7 @@ def write_candles(batch_df, batch_id):
     w = Window.partitionBy("product_id", "minute_bucket") \
               .orderBy(col("kafka_offset").desc())
 
-    latest = (
+    latest: DataFrame = (
         batch_df
         .withColumn("minute_bucket", date_trunc("minute", col("message_ts_utc")))
         .withColumn("rn", row_number().over(w))
@@ -937,7 +938,7 @@ def write_candles(batch_df, batch_id):
     )
 
     # Normalize values and prepare output
-    out = (
+    out: DataFrame = (
         latest.select(
             "product_id",
             "open",
@@ -976,7 +977,7 @@ def write_candles(batch_df, batch_id):
     logger.debug("candles_batch_written batch_id=%s", batch_id)
 
 
-def process_batch(batch_df, batch_id):
+def process_batch(batch_df: DataFrame, batch_id: int) -> None:
     """
     Process a single Spark micro-batch from the Kafka stream.
 
@@ -1015,15 +1016,15 @@ def process_batch(batch_df, batch_id):
     batch_in_progress.set()
 
     # Persist batch since it will be reused multiple times
-    batch_df = batch_df.persist(StorageLevel.MEMORY_AND_DISK)
+    batch_df: DataFrame = batch_df.persist(StorageLevel.MEMORY_AND_DISK)
 
     try:
         logger.info("batch_processing_started batch_id=%s", batch_id)
 
         # Prepare datasets (independent transformations)
-        trades_df = prepare_market_trades(batch_df)
-        tickers_df = prepare_tickers(batch_df)
-        candles_df = prepare_candles(batch_df)
+        trades_df: DataFrame = prepare_market_trades(batch_df)
+        tickers_df: DataFrame = prepare_tickers(batch_df)
+        candles_df: DataFrame = prepare_candles(batch_df)
 
         # Write datasets to PostgreSQL
         write_market_trades(trades_df, batch_id)
@@ -1056,7 +1057,7 @@ def process_batch(batch_df, batch_id):
 # Helpers
 # =====================================================================
 
-def _request_shutdown(signum, frame):
+def _request_shutdown(signum: int, frame) -> None:
     """
     Signal handler that initiates a graceful application shutdown.
 
@@ -1079,29 +1080,6 @@ def _request_shutdown(signum, frame):
     Returns
     -------
     None
-
-    Notes
-    -----
-    Why this function exists:
-    - Abrupt termination can interrupt Spark jobs mid-batch.
-    - That can lead to:
-        * Partial database writes
-        * Duplicate data on restart
-        * Corrupted downstream state
-
-    What this function does:
-    - Logs that shutdown has been requested.
-    - Sets a shared `shutdown_requested` flag.
-
-    What it DOES NOT do:
-    - It does NOT stop Spark directly.
-    - It does NOT kill threads immediately.
-
-    How shutdown actually happens:
-    1. This function sets `shutdown_requested`.
-    2. `_shutdown_watcher` detects the flag.
-    3. It waits for the current batch to finish (`batch_in_progress`).
-    4. Then safely stops the Spark streaming query.
     """
 
     logger.info("shutdown_signal_received signal=%s", signum)
@@ -1110,7 +1088,7 @@ def _request_shutdown(signum, frame):
     shutdown_requested.set()
 
 
-def _shutdown_watcher():
+def _shutdown_watcher() -> None:
     """
     Background watcher that performs a safe, coordinated shutdown of the Spark stream.
 
@@ -1154,7 +1132,7 @@ def _shutdown_watcher():
         query.stop()
 
 
-def _parse_message_timestamp(ts_col):
+def _parse_message_timestamp(ts_col: Column) -> Column:
     """
     Parse timestamp column with support for multiple formats.
 
@@ -1180,7 +1158,7 @@ def _parse_message_timestamp(ts_col):
     )
 
 
-def _jdbc_write(df, table_name):
+def _jdbc_write(df: DataFrame, table_name: str) -> None:
     """
     Write a Spark DataFrame to PostgreSQL using JDBC in parallel.
 
@@ -1219,7 +1197,7 @@ def _jdbc_write(df, table_name):
     )
 
     # Ensures multiple JDBC connections write data concurrently
-    staged = df.repartition(JDBC_WRITE_PARTITIONS)
+    staged: DataFrame = df.repartition(JDBC_WRITE_PARTITIONS)
 
     try:
         # Perform JDBC write
@@ -1288,7 +1266,7 @@ def _load_sql(file_path: str) -> str:
         sys.exit(1)
 
 
-def _run_pg_query(file_path: str = None, **kwargs):
+def _run_pg_query(file_path: str = None, **kwargs) -> None:
     """
     Execute a parameterized SQL query against PostgreSQL using a connection pool.
 
@@ -1360,7 +1338,7 @@ def _run_pg_query(file_path: str = None, **kwargs):
 
 try:
     # Read streaming data from Kafka
-    raw = (
+    raw: DataFrame = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", BOOTSTRAP)     # Kafka broker address
         .option("subscribe", TOPICS)                      # Topics to consume
@@ -1393,7 +1371,7 @@ except Exception:
     raise
 
 # Parse Kafka Messages (JSON → Structured Columns)
-parsed = (
+parsed: DataFrame = (
     raw.select(
         col("offset"),                                       # Kafka offset (for ordering/debugging)
         col("key").cast("string").alias("kafka_key"),        # Message key (product_id fallback)
@@ -1410,7 +1388,7 @@ parsed = (
 )
 
 # Filter Relevant Events
-filtered = (
+filtered: DataFrame = (
     parsed
     .where(col("events").isNotNull())                      # Ensure events exist
     .where(size(col("events")) > 0)                        # Non-empty events array
@@ -1429,7 +1407,7 @@ filtered = (
 # Core Logic
 # =====================================================================
 
-def main():
+def main() -> None:
     """
     Entry point of the streaming application.
 
@@ -1507,6 +1485,7 @@ def main():
             logger.exception("postgres_pool_close_failed")
 
         logger.info("shutdown_complete")
+
 
 if __name__ == "__main__":
     main()
