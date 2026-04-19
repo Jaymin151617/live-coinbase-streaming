@@ -8,7 +8,7 @@
 ![PostgreSQL 17.9](https://img.shields.io/badge/PostgreSQL-17.9-4169E1?logo=postgresql&logoColor=white)
 ![Metabase 0.59.6](https://img.shields.io/badge/Metabase-0.59.6-509EE3?logo=metabase&logoColor=white)
 ![Docker 4.69.0](https://img.shields.io/badge/Docker-4.69.0-2496ED?logo=docker&logoColor=white)
-![Status](https://img.shields.io/badge/status-inprogress-orange)
+![Status](https://img.shields.io/badge/status-complete-brightgreen)
 
 ## Table of Contents
 
