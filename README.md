@@ -10,6 +10,22 @@
 ![Docker 4.69.0](https://img.shields.io/badge/Docker-4.69.0-2496ED?logo=docker&logoColor=white)
 ![Status](https://img.shields.io/badge/status-inprogress-orange)
 
+## Table of Contents
+
+- [Overview](#overview)
+- [What This Project Does](#what-this-project-does)
+- [Architecture](#architecture)
+- [Repository Layout](#repository-layout)
+- [Data Model](#data-model)
+- [Prerequisites](#prerequisites)
+- [Required Secrets](#required-secrets)
+- [Environment Variables](#environment-variables)
+- [Quick Start](#quick-start)
+- [Runtime Behavior](#runtime-behavior)
+- [Local Operations](#local-operations)
+- [Current Repository Notes](#current-repository-notes)
+- [License](#license)
+
 ## Overview
 
 A real-time analytics pipeline that streams Coinbase Advanced Trade market data into Kafka, processes it with Spark Structured Streaming, stores analytics-ready tables in PostgreSQL, and exposes the warehouse to Metabase.
@@ -71,12 +87,12 @@ Metabase dashboard
 ```text
 .
 ├── .dockerignore                 # docker build ignore rules
-├── .env                          # environment variables (not committed)
+├── .env                          # environment variables (gitignored)
 ├── .gitignore                    # git ignore rules
 ├── LICENSE                       # project license (MIT)
 ├── README.md                     # project documentation
 
-├── checkpoints/                  # spark structured streaming checkpoints
+├── checkpoints/                  # spark structured streaming checkpoints (gitignored)
 │   └── coinbase_consumer/        # checkpoint data for consumer job
 │       ├── commits/              # processed batch commit logs
 │       ├── offsets/              # kafka offsets tracking
@@ -85,7 +101,7 @@ Metabase dashboard
 
 ├── docker-compose.yml            # defines postgres, metabase, and producer services
 
-├── logs/                         # application logs
+├── logs/                         # application logs (gitignored)
 │   └── consumer.log              # spark consumer logs
 
 ├── secrets/                      # sensitive credentials and ssl certs (gitignored)
@@ -190,11 +206,18 @@ Do not commit secrets. The `secrets/` directory is already ignored by git.
 
 The code expects these files:
 
-- `secrets/cb_api_key.key`: Coinbase API key identifier
-- `secrets/cb_secret_key.pem`: Coinbase private key used to build JWTs
-- `secrets/kafka_ca.pem`: Kafka CA certificate
-- `secrets/kafka_service.cert`: Kafka client certificate
-- `secrets/kafka_service.key`: Kafka client private key
+### Coinbase Secrets
+Sign up: https://www.coinbase.com/en-in/developer-platform/products/advanced-trade-api
+
+- `secrets/cb_api_key.key`: coinbase api key identifier  
+- `secrets/cb_secret_key.pem`: coinbase private key used to build JWTs  
+
+### Aiven Kafka Secrets
+Sign up: https://console.aiven.io/signup
+
+- `secrets/kafka_ca.pem`: kafka ca certificate  
+- `secrets/kafka_service.cert`: kafka client certificate  
+- `secrets/kafka_service.key`: kafka client private key  
 
 If you run the Spark consumer with a keystore and truststore, you will also need derived files such as:
 
