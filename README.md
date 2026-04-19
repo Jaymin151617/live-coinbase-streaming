@@ -105,8 +105,8 @@ Metabase dashboard
 │   │   └── consumer.py           # kafka → postgres processing pipeline
 
 │   └── sql/                      # database schema and transformation logic
-│       ├── ddls/                 # table definitions, partitions, maintenance functions
-│       ├── metabase/             # queries used to create the questions for dashboard
+│       ├── ddls/                 # table definitions, maintenance functions
+│       ├── metabase/             # queries used to create the questions
 │       ├── upsert_*.sql          # staging → final upsert and aggregation queries
 
 └── unused/                       # experimental or non-production scripts
@@ -124,28 +124,38 @@ The Spark consumer writes into the `coinbase` schema and uses a staging-plus-ups
 - `coinbase.stg_candles_snapshot`: landing table for candle rows
 - `coinbase.candles_snapshot`: latest candle snapshot per product and minute
 
-Staging Tables (`stg_*`)
+---
+
+### Staging Tables (`stg_*`)
 - No indexes or primary keys  
 - No partitioning  
 - Designed for maximum write throughput during ingestion  
 - Used as transient landing tables before transformation  
 
-Raw Trades Table (`coinbase.raw_market_trades`)
+---
+
+### Raw Trades Table (`coinbase.raw_market_trades`)
 - Primary Key: `trade_id` → prevents duplicate inserts, ensuring idempotent writes
 - Index: `trade_time_utc` → enables efficient filtering for retention and cleanup  
 - Acts as the source of truth for trade data  
 
-Final Tables (Snapshots & Aggregates)
+---
+
+### Final Tables (Snapshots & Aggregates)
 - Primary Key: (`product_id`, timestamp)  
 - Partitioned by: timestamp (time-based partitioning)  
 
-Benefits:
+---
+
+### Benefits:
 - Fast point lookups and upserts  
 - Efficient time-range queries  
 - Scalable data retention via partition pruning  
 - Simplified deletion of old data using partition drops  
 
-Design Summary
+---
+
+### Design Summary
 | Layer     | Write Optimization | Read Optimization | Partitioning |
 |----------|------------------|------------------|-------------|
 | Staging  | High             | None             | No          |
@@ -231,6 +241,8 @@ Create a `.env` file in the repository root. At minimum, document and populate t
 
 For Coinbase Advanced Trade market data, the official production endpoint is `wss://advanced-trade-ws.coinbase.com`.
 
+---
+
 ### Spark consumer and PostgreSQL
 
 - `PG_HOST`: PostgreSQL host used by the Spark consumer
@@ -244,6 +256,8 @@ For Coinbase Advanced Trade market data, the official production endpoint is `ws
 - `TRUSTSTORE`: path to the Kafka truststore used by Spark
 - `TRUSTSTORE_PASS`: truststore password
 
+---
+
 ### Docker Compose PostgreSQL settings
 
 - `POSTGRES_PORT`: host port mapped to the PostgreSQL container for external access  
@@ -254,6 +268,8 @@ For Coinbase Advanced Trade market data, the official production endpoint is `ws
 
 You will likely also need the standard PostgreSQL container initialization variables in `.env`, such as `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`, plus any Metabase-specific settings you want the container to read.
 
+---
+
 ### Docker Compose Metabase settings
 
 - `MB_DB_TYPE`: database type used by metabase for application metadata (e.g., postgres)  
@@ -263,9 +279,11 @@ You will likely also need the standard PostgreSQL container initialization varia
 - `MB_DB_PASS`: password for the metabase application database user  
 - `MB_DB_HOST`: hostname of the metabase application database (e.g., postgres container)  
 
+---
+
 ### Optional tuning
 
-Producer tuning:
+#### Producer tuning:
 
 - `WORKER_COUNT`: number of parallel producer worker threads  
 - `BATCH_SIZE`: number of messages batched before sending to Kafka  
@@ -279,7 +297,7 @@ Producer tuning:
 - `REQUEST_TIMEOUT`: maximum time to wait for Kafka response  
 - `DEBUG_LOGS`: enables verbose logging for debugging  
 
-Consumer tuning:
+#### Consumer tuning:
 
 - `SPARK_THREADS`: number of threads used by Spark for processing  
 - `SPARK_DRIVER_MEMORY`: memory allocated to the Spark driver  
@@ -298,13 +316,15 @@ Consumer tuning:
 - Create `.env` with the variables described above
 - Keep the `PG_*` values aligned with the PostgreSQL instance you intend the Spark consumer to use
 
+---
+
 ### 2. Start PostgreSQL and Metabase
 
 ```bash
 docker compose up -d postgres metabase
 ```
 
-Metabase will be available at `http://localhost:3000`.
+---
 
 ### 3. Initialize the database schema
 
@@ -320,6 +340,8 @@ psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USERNAME" -d "$PG_DATABASE" -f src/sql/
 psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USERNAME" -d "$PG_DATABASE" -f src/sql/ddls/delete_raw_trades.sql
 ```
 
+---
+
 ### 4. Start the Coinbase -> Kafka producer
 
 ```bash
@@ -331,6 +353,8 @@ To watch producer logs:
 ```bash
 docker compose logs -f producer
 ```
+
+---
 
 ### 5. Start the Spark consumer
 
@@ -346,6 +370,8 @@ If `spark-submit` is not on your `PATH`, use:
 $SPARK_HOME/bin/spark-submit src/spark/consumer.py
 ```
 
+---
+
 ### 6. Schedule database maintenance
 
 After the pipeline is live, schedule these functions externally so partitions and raw-trade retention stay healthy:
@@ -354,11 +380,14 @@ After the pipeline is live, schedule these functions externally so partitions an
 - `SELECT coinbase.drop_old_coinbase_partitions();`
 - `SELECT coinbase.cleanup_raw_trades();`
 
+---
+
 ### 7. Create the Dashboard
 
 Once data starts flowing into PostgreSQL, open Metabase at `http://localhost:3000`.
 
-Connect Metabase to PostgreSQL
+#### Connect Metabase to PostgreSQL
+
 - Click `+` next to **Data** in the left sidebar  
 - Select **PostgreSQL**  
 - Enter connection details:
@@ -367,7 +396,8 @@ Connect Metabase to PostgreSQL
   - database, username, password: as configured in `.env`  
 - Click **Save**
 
-Create Questions (Charts)
+#### Create Questions (Charts)
+
 Questions are the building blocks of dashboards.
 - SQL queries are available in `src/metabase/questions/`
 - Click `+ New` → **Question**
@@ -376,9 +406,11 @@ Questions are the building blocks of dashboards.
 - Convert to SQL mode  
 - Replace the existing query with your query from the repo  
 - Save the question  
+
 Repeat this for each chart you want.
 
-Create Dashboard
+#### Create Dashboard
+
 - Click `+ New` → **Dashboard**
 - Enter a name and create  
 - Click **Add a question**
