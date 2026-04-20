@@ -28,6 +28,8 @@
 
 ## Overview
 
+![Metabase dashboard](assets/coinbase_dashboard.gif)
+
 A real-time analytics pipeline that streams Coinbase Advanced Trade market data into Kafka, processes it with Spark Structured Streaming, stores analytics-ready tables in PostgreSQL, and exposes the warehouse to Metabase.
 
 This repository is currently set up for hands-on local or single-host deployment. The code is production-minded, but first-time bootstrap is still manual: you need to provide secrets, a `.env` file, Spark dependencies, and the initial PostgreSQL schema yourself.
@@ -91,6 +93,9 @@ Metabase dashboard
 ├── .gitignore                    # git ignore rules
 ├── LICENSE                       # project license (MIT)
 ├── README.md                     # project documentation
+
+├── assets/                       # media files used in documentation (screenshots, GIFs)
+│   └── coinbase_dashboard.gif    # preview of the dashboard
 
 ├── checkpoints/                  # spark structured streaming checkpoints (gitignored)
 │   └── coinbase_consumer/        # checkpoint data for consumer job
