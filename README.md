@@ -94,7 +94,7 @@ Metabase dashboard
 ├── LICENSE                       # project license (MIT)
 ├── README.md                     # project documentation
 
-├── assets/                       # media files used in documentation (screenshots, GIFs)
+├── assets/                       # media files used in documentation
 │   └── coinbase_dashboard.gif    # preview of the dashboard
 
 ├── checkpoints/                  # spark structured streaming checkpoints (gitignored)
