@@ -13,6 +13,7 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Demo Video](#demo-video)
 - [What This Project Does](#what-this-project-does)
 - [Architecture](#architecture)
 - [Repository Layout](#repository-layout)
@@ -24,6 +25,7 @@
 - [Runtime Behavior](#runtime-behavior)
 - [Local Operations](#local-operations)
 - [Current Repository Notes](#current-repository-notes)
+- [Future Improvements](#future-improvements)
 - [License](#license)
 
 ## Overview
@@ -33,6 +35,12 @@
 A real-time analytics pipeline that streams Coinbase Advanced Trade market data into Kafka, processes it with Spark Structured Streaming, stores analytics-ready tables in PostgreSQL, and exposes the warehouse to Metabase.
 
 This repository is currently set up for hands-on local or single-host deployment. The code is production-minded, but first-time bootstrap is still manual: you need to provide secrets, a `.env` file, Spark dependencies, and the initial PostgreSQL schema yourself.
+
+## Demo Video
+
+[![Watch the demo](https://img.youtube.com/vi/sZD4zL1pAjk/0.jpg)](https://youtu.be/sZD4zL1pAjk)
+
+A quick walkthrough of the real-time pipeline in action. For full details, refer to this repository.
 
 ## What This Project Does
 
@@ -56,6 +64,8 @@ The current configuration in [src/config.json](src/config.json) enables these pr
 - `ETH-USD` (Ethereum)
 - `LINK-USD` (Chainlink)
 - `SOL-USD` (Solana)
+
+To add more products, update `src/config.json`; for larger scale (100+), an async/event-driven approach would be required instead of the current thread-per-product model.
 
 ## Architecture
 
@@ -443,6 +453,14 @@ docker compose logs -f producer
 - There is no checked-in `.env.example`, migration runner, or bootstrap script yet
 - The database maintenance functions exist, but scheduling them is still your responsibility
 - The repo contains an `unused/` helper for replay experimentation, but the main runtime path is producer -> Kafka -> Spark -> PostgreSQL -> Metabase
+- The pipeline is optimized to run on low-end systems for demo/local setups; scaling to higher throughput or larger workloads will require more powerful hardware and resource tuning
+
+## Future Improvements
+
+- Async/event-driven ingestion for higher scalability
+- Distributed deployment of producer and consumer
+- Automated schema migrations and bootstrap scripts
+- Monitoring and alerting (Prometheus/Grafana)
 
 ## License
 
